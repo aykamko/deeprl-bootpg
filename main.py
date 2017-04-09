@@ -173,7 +173,7 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
                     "terminated": terminated,
                     "reward": np.array(rewards),
                     "action": np.array(acs),
-                    "mask": np.random.randint(bootstrap_heads) > 0.5}
+                    "mask": np.random.rand(bootstrap_heads) > 0.5}
             paths.append(path)
             episodes_this_batch += 1
             timesteps_this_batch += pathlength(path)
@@ -193,10 +193,12 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
         vpred = np.concatenate(vpreds)
         vf.fit(ob, vtarg)
 
+        ev_before = explained_variance_1d(vpred, vtarg)
+        ob = np.concatenate([path["observation"] for path in paths])
+        ev_after = explained_variance_1d(vf.predict(ob), vtarg)
+
         max_kl = -np.inf
         avg_ent = 0
-        avg_ev_before = 0
-        avg_ev_after = 0
         # adjusted_stepsize = stepsize / bootstrap_heads
         adjusted_stepsize = stepsize
         for i in range(bootstrap_heads):
@@ -238,12 +240,8 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
 
             max_kl = max(max_kl, kl)
             avg_ent += ent
-            avg_ev_before += explained_variance_1d(vpred, vtarg)
-            avg_ev_after += explained_variance_1d(vf.predict(ob), vtarg)
 
         avg_ent /= bootstrap_heads
-        avg_ev_before /= bootstrap_heads
-        avg_ev_after /= bootstrap_heads
 
         if max_kl > desired_kl * 2:
             stepsize /= 1.5
@@ -259,8 +257,8 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
         logz.log_tabular("EpLenMean", np.mean([pathlength(path) for path in paths]))
         logz.log_tabular("MaxKLOldNew", max_kl)
         logz.log_tabular("AvgEntropy", avg_ent)
-        logz.log_tabular("AvgEVBefore", avg_ev_before)
-        logz.log_tabular("AvgEVAfter", avg_ev_after)
+        logz.log_tabular("EVBefore", ev_before)
+        logz.log_tabular("EVAfter", ev_after)
         logz.log_tabular("TimestepsSoFar", total_timesteps)
         logz.log_tabular("EpisodesSoFar", total_episodes)
         logz.log_tabular("BatchTimesteps", timesteps_this_batch)

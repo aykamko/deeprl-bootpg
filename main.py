@@ -5,7 +5,7 @@ import logz
 import scipy.signal
 import sklearn.utils
 from os import path as osp
-# import click
+import click
 
 
 def discount(x, gamma):
@@ -77,8 +77,8 @@ class LinearValueFunction:
         return np.concatenate([np.ones([X.shape[0], 1]), X, np.square(X)/2.0], axis=1)
 
 
-def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, initial_stepsize,
-         desired_kl, vf_type, vf_params, animate=False):
+def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, initial_stepsize,
+             desired_kl, vf_type, vf_params, animate=False):
     tf.set_random_seed(seed)
     np.random.seed(seed)
     env = gym.make("Pendulum-v0")
@@ -94,8 +94,6 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
     sy_h1 = lrelu(dense(sy_ob, 128, 'h1', weight_init=normc_initializer(1.0)))
     sy_h2 = lrelu(dense(sy_h1, 128, 'h2', weight_init=normc_initializer(1.0)))
 
-    sy_stepsize = tf.placeholder(shape=[], dtype=tf.float32)
-
     sy_sampled_acs = []
     sy_means = []
     sy_logstds = []
@@ -103,6 +101,7 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
     sy_old_logstds = []
     sy_kls = []
     sy_ents = []
+    sy_stepsizes = []
     update_ops = []
     for i in range(bootstrap_heads):
         sy_mean = dense(sy_h2, ac_dim, 'mean_out%d' % i, weight_init=normc_initializer(0.1))  # Mean control output
@@ -110,12 +109,16 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
         sy_std = tf.exp(sy_logstd)
 
         sy_dist = tf.contrib.distributions.Normal(mu=sy_mean, sigma=sy_std, validate_args=True)
-        sy_sampled_ac = sy_dist.sample(ac_dim)[0, :, 0]
-        sy_ac_logprob = tf.squeeze(tf.log(sy_dist.prob(sy_ac)))  # log-prob of actions taken -- used for policy gradient calculation
+        sy_sampled_ac = sy_dist.sample()
+
+        sy_ac_prob = sy_dist.prob(sy_ac)
+        sy_safe_ac_prob = tf.maximum(sy_ac_prob, np.finfo(np.float32).eps)  # to avoid log(0) -> nan issues
+        sy_ac_logprob = tf.squeeze(tf.log(sy_safe_ac_prob))  # log-prob of actions taken -- used for policy gradient calculation
 
         sy_old_mean = tf.placeholder(shape=[None, ac_dim], name='old_mean%d' % i, dtype=tf.float32)
         sy_old_logstd = tf.placeholder(shape=[ac_dim], name='old_logstd%d' % i, dtype=tf.float32)
         sy_old_std = tf.exp(sy_old_logstd)
+
         sy_old_dist = tf.contrib.distributions.Normal(mu=sy_old_mean, sigma=sy_old_std, validate_args=True)
 
         sy_kl = tf.reduce_mean(tf.contrib.distributions.kl(sy_old_dist, sy_dist, allow_nan=False))
@@ -123,6 +126,7 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
 
         sy_surr = -tf.reduce_mean(sy_adv * sy_ac_logprob)  # Loss function that we'll differentiate to get the policy gradient ("surr" is for "surrogate loss")
 
+        sy_stepsize = tf.placeholder(shape=[], dtype=tf.float32)
         update_op = tf.train.AdamOptimizer(sy_stepsize).minimize(sy_surr)
 
         sy_sampled_acs.append(sy_sampled_ac)
@@ -132,6 +136,7 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
         sy_old_logstds.append(sy_old_logstd)
         sy_kls.append(sy_kl)
         sy_ents.append(sy_ent)
+        sy_stepsizes.append(sy_stepsize)
         update_ops.append(update_op)
 
     sess = tf.Session()
@@ -140,7 +145,7 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
 
     total_timesteps = 0
     total_episodes = 0
-    stepsize = initial_stepsize
+    stepsizes = [initial_stepsize for _ in range(bootstrap_heads)]
 
     for i in range(n_iter):
         print("********** Iteration %i ************" % i)
@@ -199,8 +204,6 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
 
         max_kl = -np.inf
         avg_ent = 0
-        # adjusted_stepsize = stepsize / bootstrap_heads
-        adjusted_stepsize = stepsize
         for i in range(bootstrap_heads):
             update_op = update_ops[i]
             sy_mean = sy_means[i]
@@ -209,6 +212,7 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
             sy_old_logstd = sy_old_logstds[i]
             sy_kl = sy_kls[i]
             sy_ent = sy_ents[i]
+            sy_stepsize = sy_stepsizes[i]
 
             # Estimate advantage function
             advs = []
@@ -232,27 +236,29 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
                 sy_ob: ob,
                 sy_ac: ac,
                 sy_adv: standardized_adv,
-                sy_stepsize: adjusted_stepsize})
+                sy_stepsize: stepsizes[i]})
+            print("head {}, stddev: {}".format(i, old_logstd))
             kl, ent = sess.run([sy_kl, sy_ent], feed_dict={
                 sy_ob: ob,
                 sy_old_mean: old_mean,
                 sy_old_logstd: old_logstd})
+
+            if kl > desired_kl * 2:
+                stepsizes[i] /= 1.5
+                print('stepsizes[%d] -> %s' % (i, stepsizes[i]))
+            elif max_kl < desired_kl / 2:
+                stepsizes[i] *= 1.5
+                print('stepsizes[%d] -> %s' % (i, stepsizes[i]))
+            else:
+                print('stepsize OK')
 
             max_kl = max(max_kl, kl)
             avg_ent += ent
 
         avg_ent /= bootstrap_heads
 
-        if max_kl > desired_kl * 2:
-            stepsize /= 1.5
-            print('stepsize -> %s' % stepsize)
-        elif max_kl < desired_kl / 2:
-            stepsize *= 1.5
-            print('stepsize -> %s' % stepsize)
-        else:
-            print('stepsize OK')
-
         # Log diagnostics
+        logz.log_tabular("Head", bootstrap_i)
         logz.log_tabular("EpRewMean", np.mean([path["reward"].sum() for path in paths]))
         logz.log_tabular("EpLenMean", np.mean([pathlength(path) for path in paths]))
         logz.log_tabular("MaxKLOldNew", max_kl)
@@ -268,14 +274,16 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
         logz.dump_tabular()
 
 
-if __name__ == '__main__':
-    main(
+@click.command()
+@click.option('-k', default=1)
+def main(k):
+    pendulum(
         logdir=osp.join(osp.abspath(__file__), '/log'),
         animate=True,
         gamma=0.97,
-        bootstrap_heads=5,
-        # min_timesteps_per_batch=2500,
+        bootstrap_heads=k,
         min_timesteps_per_batch=5000,
+        # min_timesteps_per_batch=5000,
         n_iter=300,
         initial_stepsize=1e-3,
         seed=0,
@@ -283,3 +291,7 @@ if __name__ == '__main__':
         vf_type='linear',
         vf_params={}
     )
+
+
+if __name__ == '__main__':
+    main()

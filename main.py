@@ -50,6 +50,12 @@ def pathlength(path):
     return len(path["reward"])
 
 
+def lrelu(x, leak=0.2):
+    f1 = 0.5 * (1 + leak)
+    f2 = 0.5 * (1 - leak)
+    return f1 * x + f2 * abs(x)
+
+
 class LinearValueFunction:
     coef = None
 
@@ -85,8 +91,8 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
     sy_ac = tf.placeholder(shape=[None, ac_dim], name='ac', dtype=tf.float32)  # batch of actions taken by the policy, used for policy gradient computation
     sy_adv = tf.placeholder(shape=[None], name='adv', dtype=tf.float32)  # advantage function estimate
 
-    sy_h1 = tf.nn.elu(dense(sy_ob, 128, 'h1', weight_init=normc_initializer(1.0)))
-    sy_h2 = tf.nn.elu(dense(sy_h1, 128, 'h2', weight_init=normc_initializer(1.0)))
+    sy_h1 = lrelu(dense(sy_ob, 128, 'h1', weight_init=normc_initializer(1.0)))
+    sy_h2 = lrelu(dense(sy_h1, 128, 'h2', weight_init=normc_initializer(1.0)))
 
     sy_stepsize = tf.placeholder(shape=[], dtype=tf.float32)
 
@@ -166,7 +172,8 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
             path = {"observation": np.array(obs),
                     "terminated": terminated,
                     "reward": np.array(rewards),
-                    "action": np.array(acs)}
+                    "action": np.array(acs),
+                    "mask": np.random.randint(bootstrap_heads) > 0.5}
             paths.append(path)
             episodes_this_batch += 1
             timesteps_this_batch += pathlength(path)
@@ -176,13 +183,23 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
         total_episodes += episodes_this_batch
         total_timesteps += timesteps_this_batch
 
-        avg_kl = 0
+        # Fit value function
+        vtargs, vpreds = [], []
+        for path in paths:
+            vtargs.append(discount(path["reward"], gamma))
+            vpreds.append(vf.predict(path["observation"]))
+        ob = np.concatenate([path["observation"] for path in paths])
+        vtarg = np.concatenate(vtargs)
+        vpred = np.concatenate(vpreds)
+        vf.fit(ob, vtarg)
+
+        max_kl = -np.inf
         avg_ent = 0
         avg_ev_before = 0
         avg_ev_after = 0
-        adjusted_stepsize = stepsize / bootstrap_heads
+        # adjusted_stepsize = stepsize / bootstrap_heads
+        adjusted_stepsize = stepsize
         for i in range(bootstrap_heads):
-            bootstrapped_paths = sklearn.utils.resample(paths)
             update_op = update_ops[i]
             sy_mean = sy_means[i]
             sy_old_mean = sy_old_means[i]
@@ -192,24 +209,21 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
             sy_ent = sy_ents[i]
 
             # Estimate advantage function
-            vtargs, vpreds, advs = [], [], []
-            for path in bootstrapped_paths:
+            advs = []
+            for path in paths:
+                if not path["mask"][i]:
+                    continue
                 rew_t = path["reward"]
                 return_t = discount(rew_t, gamma)
                 vpred_t = vf.predict(path["observation"])
                 adv_t = return_t - vpred_t
                 advs.append(adv_t)
-                vtargs.append(return_t)
-                vpreds.append(vpred_t)
 
             # Build arrays for policy update
-            ob = np.concatenate([path["observation"] for path in bootstrapped_paths])
-            ac = np.concatenate([path["action"] for path in bootstrapped_paths])
+            ob = np.concatenate([path["observation"] for path in paths if path["mask"][i]])
+            ac = np.concatenate([path["action"] for path in paths if path["mask"][i]])
             adv = np.concatenate(advs)
             standardized_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-            vtarg = np.concatenate(vtargs)
-            vpred = np.concatenate(vpreds)
-            vf.fit(ob, vtarg)
 
             # Policy update
             _, old_mean, old_logstd = sess.run([update_op, sy_mean, sy_logstd], feed_dict={
@@ -222,20 +236,19 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
                 sy_old_mean: old_mean,
                 sy_old_logstd: old_logstd})
 
-            avg_kl += kl
+            max_kl = max(max_kl, kl)
             avg_ent += ent
             avg_ev_before += explained_variance_1d(vpred, vtarg)
             avg_ev_after += explained_variance_1d(vf.predict(ob), vtarg)
 
-        avg_kl /= bootstrap_heads
         avg_ent /= bootstrap_heads
         avg_ev_before /= bootstrap_heads
         avg_ev_after /= bootstrap_heads
 
-        if avg_kl > desired_kl * 2:
+        if max_kl > desired_kl * 2:
             stepsize /= 1.5
             print('stepsize -> %s' % stepsize)
-        elif avg_kl < desired_kl / 2:
+        elif max_kl < desired_kl / 2:
             stepsize *= 1.5
             print('stepsize -> %s' % stepsize)
         else:
@@ -244,7 +257,7 @@ def main(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, 
         # Log diagnostics
         logz.log_tabular("EpRewMean", np.mean([path["reward"].sum() for path in paths]))
         logz.log_tabular("EpLenMean", np.mean([pathlength(path) for path in paths]))
-        logz.log_tabular("AvgKLOldNew", avg_kl)
+        logz.log_tabular("MaxKLOldNew", max_kl)
         logz.log_tabular("AvgEntropy", avg_ent)
         logz.log_tabular("AvgEVBefore", avg_ev_before)
         logz.log_tabular("AvgEVAfter", avg_ev_after)
@@ -263,7 +276,8 @@ if __name__ == '__main__':
         animate=True,
         gamma=0.97,
         bootstrap_heads=5,
-        min_timesteps_per_batch=2500,
+        # min_timesteps_per_batch=2500,
+        min_timesteps_per_batch=5000,
         n_iter=300,
         initial_stepsize=1e-3,
         seed=0,

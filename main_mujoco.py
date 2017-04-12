@@ -1,12 +1,9 @@
-import site
-site.addsitedir('/usr/local/lib/python3.6/site-packages')
-
+#!/usr/bin/env python3.5
 import numpy as np
 import tensorflow as tf
 import gym
 import logz
 import scipy.signal
-import sklearn.utils
 from os import path as osp
 import click
 
@@ -58,15 +55,15 @@ def lrelu(x, leak=0.2):
     f2 = 0.5 * (1 - leak)
     return f1 * x + f2 * abs(x)
 
+
 def sample_bootstrap_heads(rewards):
     heads = len(rewards)
-    min_reward, min_head = min((rewards[i],i) for i in xrange(heads))
-    print rewards
-    print min_reward,min_head
+    min_reward, min_head = min((rewards[i], i) for i in range(heads))
     head = np.random.randint(heads+1)
     if head == heads:
         head = min_head
     return head
+
 
 class LinearValueFunction:
     coef = None
@@ -93,13 +90,11 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
              desired_kl, vf_type, vf_params, animate=False):
     tf.set_random_seed(seed)
     np.random.seed(seed)
-    #env = gym.make("Pendulum-v0")
     env = gym.make("HalfCheetah-v1")
     ob_dim = env.observation_space.shape[0]
     ac_dim = env.action_space.shape[0]
     print("ob_dim is ", ob_dim)
     print("ac_dim is ", ac_dim)
-    # logz.configure_output_dir(logdir, CLEAR_LOGS)
     vf = LinearValueFunction()
 
     sy_ob = tf.placeholder(shape=[None, ob_dim], name='ob', dtype=tf.float32)  # batch of observations
@@ -118,6 +113,7 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
     sy_ents = []
     sy_stepsizes = []
     update_ops = []
+
     for i in range(bootstrap_heads):
         sy_mean = dense(sy_h2, ac_dim, 'mean_out%d' % i, weight_init=normc_initializer(0.1))  # Mean control output
         sy_logstd = tf.get_variable('logstd%d' % i, [ac_dim], initializer=tf.zeros_initializer())  # Variance
@@ -126,8 +122,7 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
         sy_dist = tf.contrib.distributions.Normal(mu=sy_mean, sigma=sy_std, validate_args=True)
         sy_sampled_ac = sy_dist.sample()
 
-        #sy_ac_prob = tf.reduce_prod(sy_dist.prob(sy_ac),axis=1)
-        sy_ac_prob = tf.reduce_prod(sy_dist.prob(sy_ac),axis=1)
+        sy_ac_prob = tf.reduce_prod(sy_dist.prob(sy_ac), axis=1)
         sy_safe_ac_prob = tf.maximum(sy_ac_prob, np.finfo(np.float32).eps)  # to avoid log(0) -> nan issues
         sy_ac_logprob = tf.squeeze(tf.log(sy_safe_ac_prob))  # log-prob of actions taken -- used for policy gradient calculation
 
@@ -158,7 +153,6 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
     sess = tf.Session()
     sess.__enter__()  # equivalent to `with sess:`
     tf.global_variables_initializer().run()  # pylint: disable=E1101
-
 
     total_timesteps = 0
     total_episodes = 0
@@ -200,7 +194,7 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
                     "terminated": terminated,
                     "reward": np.array(rewards),
                     "action": np.array(acs),
-                    "mask": np.random.rand(bootstrap_heads) > 0.5}
+                    "mask": (np.random.rand(bootstrap_heads) > 0.5) if bootstrap_heads > 1 else np.array([True])}
             paths.append(path)
             episodes_this_batch += 1
             timesteps_this_batch += pathlength(path)
@@ -254,7 +248,6 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
                 advs.append(adv_t)
 
             # Build arrays for policy update
-            print len(paths)
             ob = np.concatenate([path["observation"] for path in paths if path["mask"][i]])
             ac = np.concatenate([path["action"] for path in paths if path["mask"][i]])
             adv = np.concatenate(advs)
@@ -266,7 +259,7 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
                 sy_ac: ac,
                 sy_adv: standardized_adv,
                 sy_stepsize: stepsizes[i]})
-            
+
             print("head {}, stddev: {}".format(i, old_logstd))
             kl, ent = sess.run([sy_kl, sy_ent], feed_dict={
                 sy_ob: ob,
@@ -313,8 +306,8 @@ def main(k):
         animate=False,
         gamma=0.97,
         bootstrap_heads=k,
-        min_timesteps_per_batch=20000,
-        # min_timesteps_per_batch=5000,
+        # min_timesteps_per_batch=20000,
+        min_timesteps_per_batch=5000,
         n_iter=1500,
         initial_stepsize=1e-3,
         initial_reward=-650,

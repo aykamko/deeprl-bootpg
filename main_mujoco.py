@@ -119,6 +119,8 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
     sy_surrs = []
     sy_stepsizes = []
     update_ops = []
+    sy_max_grads = []
+    sy_max_grad_norms = []
 
     for i in range(bootstrap_heads):
         sy_head_W = tf.get_variable('mean%d/w' % i, [sy_h2.get_shape()[1], ac_dim], initializer=normc_initializer(0.1))
@@ -130,8 +132,8 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
 
         sy_sampled_ac = sy_dist.sample()
 
-        sy_ephead_W = tf.placeholder(shape=[sy_h2.get_shape()[1], ac_dim], name='ephead_head_W', dtype=tf.float32)
-        sy_ephead_b = tf.placeholder(shape=[ac_dim], name='ephead_head_b', dtype=tf.float32)
+        sy_ephead_W = tf.placeholder(shape=[sy_h2.get_shape()[1], ac_dim], name='ephead_head_W%d' % i, dtype=tf.float32)
+        sy_ephead_b = tf.placeholder(shape=[ac_dim], name='ephead_head_b%d' % i, dtype=tf.float32)
         sy_ephead_mean = tf.matmul(sy_h2, sy_ephead_W) + sy_ephead_b
         sy_ephead_logstd = tf.placeholder(shape=[ac_dim], name='ephead_logstd%d' % i, dtype=tf.float32)
         sy_ephead_std = tf.exp(sy_ephead_logstd)
@@ -151,7 +153,13 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
         sy_surr = -tf.reduce_mean(sy_adv * (sy_ac_prob / sy_ac_epheadprob))  # Loss function that we'll differentiate to get the policy gradient ("surr" is for "surrogate loss")
 
         sy_stepsize = tf.placeholder(shape=[], dtype=tf.float32)
-        update_op = tf.train.AdamOptimizer(sy_stepsize).minimize(sy_surr)
+        optimizer = tf.train.AdamOptimizer(sy_stepsize)
+
+        gvs = optimizer.compute_gradients(sy_surr)
+        sy_max_grad = tf.reduce_max(tf.stack([tf.reduce_max(grad) for grad, _ in gvs if grad is not None]))
+        sy_max_grad_norm = tf.reduce_max(tf.stack([tf.norm(grad) for grad, _ in gvs if grad is not None]))
+        capped_gvs = [(tf.clip_by_value(grad, -1.0, 1.0), var) for grad, var in gvs if grad is not None]
+        update_op = optimizer.apply_gradients(capped_gvs)
 
         sy_sampled_acs.append(sy_sampled_ac)
         sy_means.append(sy_mean)
@@ -168,6 +176,9 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
         sy_surrs.append(sy_surr)
         sy_stepsizes.append(sy_stepsize)
         update_ops.append(update_op)
+        # sy_max_grads.append(sy_max_grad)
+        sy_max_grads.append(sy_max_grad)
+        sy_max_grad_norms.append(sy_max_grad_norm)
 
     sess = tf.Session()
     sess.__enter__()  # equivalent to `with sess:`
@@ -281,8 +292,8 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
             standardized_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
             # Policy update
-            _, loss, batch_mean, batch_logstd = sess.run(
-                [update_op, sy_surr, sy_mean, sy_logstd],
+            _, loss, batch_mean, batch_logstd, max_grad, max_grad_norm = sess.run(
+                [update_op, sy_surr, sy_mean, sy_logstd, sy_max_grads[i], sy_max_grad_norms[i]],
                 feed_dict={
                     sy_ob: ob,
                     sy_ac: ac,
@@ -292,7 +303,7 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
                     sy_adv: standardized_adv,
                     sy_stepsize: stepsizes[i]})
 
-            print("head: {}. loss: {}".format(i, loss))
+            print("head: {}, loss: {}, maxgrad: {}, maxnorm: {}".format(i, loss, max_grad, max_grad_norm))
             kl, ent = sess.run([sy_kl, sy_ent], feed_dict={
                 sy_ob: ob,
                 sy_batch_mean: batch_mean,

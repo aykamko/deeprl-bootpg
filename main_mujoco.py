@@ -106,36 +106,49 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
 
     sy_sampled_acs = []
     sy_means = []
+    sy_head_Ws = []
+    sy_head_bs = []
     sy_logstds = []
-    sy_old_means = []
-    sy_old_logstds = []
+    sy_ephead_Ws = []
+    sy_ephead_bs = []
+    sy_ephead_logstds = []
+    sy_batch_means = []
+    sy_batch_logstds = []
     sy_kls = []
     sy_ents = []
+    sy_surrs = []
     sy_stepsizes = []
     update_ops = []
 
     for i in range(bootstrap_heads):
-        sy_mean = dense(sy_h2, ac_dim, 'mean_out%d' % i, weight_init=normc_initializer(0.1))  # Mean control output
+        sy_head_W = tf.get_variable('mean%d/w' % i, [sy_h2.get_shape()[1], ac_dim], initializer=normc_initializer(0.1))
+        sy_head_b = tf.get_variable('mean%d/b' % i, [ac_dim], initializer=tf.zeros_initializer())
+        sy_mean = tf.matmul(sy_h2, sy_head_W) + sy_head_b
         sy_logstd = tf.get_variable('logstd%d' % i, [ac_dim], initializer=tf.zeros_initializer())  # Variance
         sy_std = tf.exp(sy_logstd)
-
         sy_dist = tf.contrib.distributions.Normal(mu=sy_mean, sigma=sy_std, validate_args=True)
+
         sy_sampled_ac = sy_dist.sample()
 
+        sy_ephead_W = tf.placeholder(shape=[sy_h2.get_shape()[1], ac_dim], name='ephead_head_W', dtype=tf.float32)
+        sy_ephead_b = tf.placeholder(shape=[ac_dim], name='ephead_head_b', dtype=tf.float32)
+        sy_ephead_mean = tf.matmul(sy_h2, sy_ephead_W) + sy_ephead_b
+        sy_ephead_logstd = tf.placeholder(shape=[ac_dim], name='ephead_logstd%d' % i, dtype=tf.float32)
+        sy_ephead_std = tf.exp(sy_ephead_logstd)
+        sy_ephead_dist = tf.contrib.distributions.Normal(mu=sy_ephead_mean, sigma=sy_ephead_std, validate_args=True)
+
         sy_ac_prob = tf.reduce_prod(sy_dist.prob(sy_ac), axis=1)
-        sy_safe_ac_prob = tf.maximum(sy_ac_prob, np.finfo(np.float32).eps)  # to avoid log(0) -> nan issues
-        sy_ac_logprob = tf.squeeze(tf.log(sy_safe_ac_prob))  # log-prob of actions taken -- used for policy gradient calculation
+        sy_ac_epheadprob = tf.reduce_prod(sy_ephead_dist.prob(sy_ac), axis=1)
 
-        sy_old_mean = tf.placeholder(shape=[None, ac_dim], name='old_mean%d' % i, dtype=tf.float32)
-        sy_old_logstd = tf.placeholder(shape=[ac_dim], name='old_logstd%d' % i, dtype=tf.float32)
-        sy_old_std = tf.exp(sy_old_logstd)
+        sy_batch_mean = tf.placeholder(shape=[None, ac_dim], name='batch_mean%d' % i, dtype=tf.float32)
+        sy_batch_logstd = tf.placeholder(shape=[ac_dim], name='batch_logstd%d' % i, dtype=tf.float32)
+        sy_batch_std = tf.exp(sy_batch_logstd)
+        sy_batch_dist = tf.contrib.distributions.Normal(mu=sy_batch_mean, sigma=sy_batch_std, validate_args=True)
 
-        sy_old_dist = tf.contrib.distributions.Normal(mu=sy_old_mean, sigma=sy_old_std, validate_args=True)
-
-        sy_kl = tf.reduce_mean(tf.contrib.distributions.kl(sy_old_dist, sy_dist, allow_nan=False))
+        sy_kl = tf.reduce_mean(tf.contrib.distributions.kl(sy_batch_dist, sy_dist, allow_nan=False))
         sy_ent = tf.reduce_mean(sy_dist.entropy())
 
-        sy_surr = -tf.reduce_mean(sy_adv * sy_ac_logprob)  # Loss function that we'll differentiate to get the policy gradient ("surr" is for "surrogate loss")
+        sy_surr = -tf.reduce_mean(sy_adv * (sy_ac_prob / sy_ac_epheadprob))  # Loss function that we'll differentiate to get the policy gradient ("surr" is for "surrogate loss")
 
         sy_stepsize = tf.placeholder(shape=[], dtype=tf.float32)
         update_op = tf.train.AdamOptimizer(sy_stepsize).minimize(sy_surr)
@@ -143,10 +156,16 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
         sy_sampled_acs.append(sy_sampled_ac)
         sy_means.append(sy_mean)
         sy_logstds.append(sy_logstd)
-        sy_old_means.append(sy_old_mean)
-        sy_old_logstds.append(sy_old_logstd)
+        sy_head_Ws.append(sy_head_W)
+        sy_head_bs.append(sy_head_b)
+        sy_ephead_Ws.append(sy_ephead_W)
+        sy_ephead_bs.append(sy_ephead_b)
+        sy_ephead_logstds.append(sy_ephead_logstd)
+        sy_batch_means.append(sy_batch_mean)
+        sy_batch_logstds.append(sy_batch_logstd)
         sy_kls.append(sy_kl)
         sy_ents.append(sy_ent)
+        sy_surrs.append(sy_surr)
         sy_stepsizes.append(sy_stepsize)
         update_ops.append(update_op)
 
@@ -164,8 +183,9 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
         print("********** Iteration %i ************" % i)
 
         # Randomly sample a bootstrap head
-        # bootstrap_i = np.random.randint(bootstrap_heads)
-        bootstrap_i = sample_bootstrap_heads(rewards_saved)
+        bootstrap_i = np.random.randint(bootstrap_heads)
+        print("Selecting head %d" % bootstrap_i)
+        # bootstrap_i = sample_bootstrap_heads(rewards_saved)
         sy_sampled_ac = sy_sampled_acs[bootstrap_i]
 
         # Collect paths until we have enough timesteps
@@ -226,14 +246,21 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
 
         max_kl = -np.inf
         avg_ent = 0
+        ephead_W = sy_head_Ws[bootstrap_i].eval()
+        ephead_b = sy_head_bs[bootstrap_i].eval()
+        ephead_logstd = sy_logstds[bootstrap_i].eval()
         for i in range(bootstrap_heads):
             update_op = update_ops[i]
             sy_mean = sy_means[i]
-            sy_old_mean = sy_old_means[i]
             sy_logstd = sy_logstds[i]
-            sy_old_logstd = sy_old_logstds[i]
+            sy_ephead_W = sy_ephead_Ws[i]
+            sy_ephead_b = sy_ephead_bs[i]
+            sy_ephead_logstd = sy_ephead_logstds[i]
+            sy_batch_mean = sy_batch_means[i]
+            sy_batch_logstd = sy_batch_logstds[i]
             sy_kl = sy_kls[i]
             sy_ent = sy_ents[i]
+            sy_surr = sy_surrs[i]
             sy_stepsize = sy_stepsizes[i]
 
             # Estimate advantage function
@@ -254,17 +281,22 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
             standardized_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
             # Policy update
-            _, old_mean, old_logstd = sess.run([update_op, sy_mean, sy_logstd], feed_dict={
-                sy_ob: ob,
-                sy_ac: ac,
-                sy_adv: standardized_adv,
-                sy_stepsize: stepsizes[i]})
+            _, loss, batch_mean, batch_logstd = sess.run(
+                [update_op, sy_surr, sy_mean, sy_logstd],
+                feed_dict={
+                    sy_ob: ob,
+                    sy_ac: ac,
+                    sy_ephead_W: ephead_W,
+                    sy_ephead_b: ephead_b,
+                    sy_ephead_logstd: ephead_logstd,
+                    sy_adv: standardized_adv,
+                    sy_stepsize: stepsizes[i]})
 
-            print("head {}, stddev: {}".format(i, old_logstd))
+            print("head: {}. loss: {}".format(i, loss))
             kl, ent = sess.run([sy_kl, sy_ent], feed_dict={
                 sy_ob: ob,
-                sy_old_mean: old_mean,
-                sy_old_logstd: old_logstd})
+                sy_batch_mean: batch_mean,
+                sy_batch_logstd: batch_logstd})
 
             if kl > desired_kl * 2:
                 stepsizes[i] /= 1.5
@@ -301,13 +333,14 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
 @click.command()
 @click.option('-k', default=1)
 def main(k):
+    print('Number of heads: %d' % k)
     pendulum(
         logdir=osp.join(osp.abspath(__file__), '/log'),
         animate=False,
         gamma=0.97,
         bootstrap_heads=k,
-        # min_timesteps_per_batch=20000,
-        min_timesteps_per_batch=5000,
+        min_timesteps_per_batch=20000,
+        # min_timesteps_per_batch=5000,
         n_iter=1500,
         initial_stepsize=1e-3,
         initial_reward=-650,

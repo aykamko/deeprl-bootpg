@@ -304,7 +304,7 @@ def main(k):
     pendulum(
         logdir=osp.join(osp.abspath(__file__), '/log'),
         animate=False,
-        gamma=0.97,
+        gamma=0.99,
         bootstrap_heads=k,
         # min_timesteps_per_batch=20000,
         min_timesteps_per_batch=5000,

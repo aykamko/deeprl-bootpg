@@ -76,19 +76,18 @@ def flatgrad(loss, tfvars):
 
 
 def construct_set_vars_from_flat_op(var_list):
-    assigns = []
     shapes = [var.get_shape().as_list() for var in var_list]
     total_size = sum(np.prod(shape) for shape in shapes)
     sy_theta = tf.placeholder(shape=[total_size], dtype=tf.float32)
 
     start = 0
-    assigns = []
-    for shape, v in zip(shapes, var_list):
+    assign_ops = []
+    for shape, var in zip(shapes, var_list):
         size = np.prod(shape)
-        assigns.append(
-            tf.assign(v, tf.reshape(sy_theta[start:(start + size)], shape)))
+        assign_ops += [tf.assign(var, tf.reshape(sy_theta[start:start+size], shape))]
         start += size
-        return sy_theta, tf.group(*assigns)
+
+    return sy_theta, tf.group(*assign_ops)
 
 
 def linesearch(f, x, fullstep, expected_improve_rate):
@@ -150,7 +149,7 @@ class LinearValueFunction:
 
 
 class NnValueFunction:
-    def __init__(self, ob_dim, n_epochs=50, stepsize=1e-3):
+    def __init__(self, ob_dim, n_epochs=10, stepsize=1e-3):
         self.ob_dim = ob_dim
         self.n_epochs = n_epochs
         self.stepsize = stepsize
@@ -182,19 +181,19 @@ class NnValueFunction:
         }))
 
 
-def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch, initial_stepsize, initial_reward,
-             desired_kl, vf_type, vf_params, animate=False):
+def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,
+             initial_stepsize, initial_reward, desired_kl, vf_type, vf_params, animate=False):
     tf.set_random_seed(seed)
     np.random.seed(seed)
-    env = gym.make("HalfCheetah-v1")
+    env = gym.make(gym_env)
     ob_dim = env.observation_space.shape[0]
     ac_dim = env.action_space.shape[0]
-    print("ob_dim is ", ob_dim)
-    print("ac_dim is ", ac_dim)
+    print("ob_dim is:", ob_dim)
+    print("ac_dim is:", ac_dim)
     vf = {
         'linear': LinearValueFunction,
         'nn': NnValueFunction,
-    }(ob_dim, **vf_params)
+    }[vf_type](ob_dim, **vf_params)
 
     with tf.variable_scope('shared'):
         sy_ob = tf.placeholder(shape=[None, ob_dim], name='ob', dtype=tf.float32)  # batch of observations
@@ -215,42 +214,44 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
     sy_ents = []
     sy_surrs = []
     sy_flat_tans = []
-    sy_flat_gvps = []
+    sy_fisher_vec_prods = []
     ops_get_vars_flat = []
     ops_set_vars_from_flat = []
     sy_thetas = []
 
     for i in range(bootstrap_heads):
         with tf.variable_scope('head%d' % i):
-            sy_mean = dense(sy_h2, ac_dim, 'mean%d' % i, weight_init=normc_initializer(0.1))  # Mean control output
-            sy_logstd = tf.get_variable('logstd%d' % i, [ac_dim], initializer=tf.zeros_initializer())  # Variance
+            sy_mean = dense(sy_h2, ac_dim, 'mean', weight_init=normc_initializer(0.1))  # Mean control output
+            sy_logstd = tf.get_variable('logstd', [ac_dim], initializer=tf.zeros_initializer())  # Variance
             sy_std = tf.exp(sy_logstd)
             sy_dist = tf.contrib.distributions.Normal(mu=sy_mean, sigma=sy_std, validate_args=True)
 
-            sy_old_mean = tf.placeholder(shape=[None, ac_dim], name='old_mean%d' % i, dtype=tf.float32)
-            sy_old_logstd = tf.placeholder(shape=[ac_dim], name='old_logstd%d' % i, dtype=tf.float32)
+            sy_old_mean = tf.placeholder(shape=[None, ac_dim], name='oldmean', dtype=tf.float32)
+            sy_old_logstd = tf.placeholder(shape=[ac_dim], name='oldlogstd', dtype=tf.float32)
             sy_old_std = tf.exp(sy_old_logstd)
             sy_old_dist = tf.contrib.distributions.Normal(mu=sy_old_mean, sigma=sy_old_std, validate_args=True)
 
             sy_sampled_ac = sy_dist.sample()
 
-            sy_ac_prob = tf.reduce_prod(sy_dist.prob(sy_ac), axis=1)
-            sy_safe_ac_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)  # to avoid log(0) -> nan issues
-            sy_ac_logprob = tf.squeeze(tf.log(sy_safe_ac_prob))  # log-prob of actions taken -- used for policy gradient calculation
+            sy_ac_prob = sy_dist.prob(sy_ac)
+            # sy_safe_ac_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)  # to avoid log(0) -> nan issues
+            # sy_ac_logprob = tf.squeeze(tf.log(sy_safe_ac_prob))  # log-prob of actions taken -- used for policy gradient calculation
+
+            sy_old_ac_prob = sy_old_dist.prob(sy_ac)
+            # sy_old_safe_ac_prob = tf.maximum(sy_old_ac_prob, MACHINE_EPS)  # to avoid log(0) -> nan issues
+            # sy_old_ac_logprob = tf.squeeze(tf.log(sy_old_safe_ac_prob))
+
+            sy_surr = -tf.reduce_mean((sy_ac_prob / sy_old_ac_prob) * sy_adv)
 
         var_list = shared_vars + tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=('head%d' % i))
 
         sy_kl = tf.reduce_mean(tf.contrib.distributions.kl(sy_old_dist, sy_dist, allow_nan=False))
         sy_ent = tf.reduce_mean(sy_dist.entropy())
 
-        sy_surr = -tf.reduce_mean(sy_ac_logprob * sy_adv)
-
-        sy_pg = flatgrad(sy_surr, var_list)
+        sy_policy_grad = flatgrad(sy_surr, var_list)
 
         sy_fixed_dist = tf.contrib.distributions.Normal(
-            mu=tf.stop_gradient(sy_mean),
-            sigma=tf.stop_gradient(sy_std),
-            validate_args=True)
+            mu=tf.stop_gradient(sy_mean), sigma=tf.stop_gradient(sy_std), validate_args=True)
         sy_kl_firstfixed = tf.reduce_mean(tf.contrib.distributions.kl(sy_fixed_dist, sy_dist, allow_nan=False))
         sy_grads = tf.gradients(sy_kl_firstfixed, var_list)
 
@@ -260,31 +261,27 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
         sy_tans = []
         for var_shape in var_shapes:
             size = np.prod(var_shape)
-            sy_tan = tf.reshape(sy_flat_tan[start:(start + size)], var_shape)
-            sy_tans.append(sy_tan)
+            sy_tans += [tf.reshape(sy_flat_tan[start:start+size], var_shape)]
             start += size
 
         sy_gvp = [tf.reduce_sum(g * t) for (g, t) in zip(sy_grads, sy_tans)]  # gradient vector product
-        sy_flat_gvp = flatgrad(sy_gvp, var_list)
+        sy_fisher_vec_prod = flatgrad(sy_gvp, var_list)
 
         op_get_vars_flat = tf.concat(
-            [tf.reshape(v, [np.prod(v.get_shape().as_list())]) for v in var_list],
+            [tf.reshape(var, [np.prod(var.get_shape().as_list())]) for var in var_list],
             axis=0)
         sy_theta, op_set_vars_from_flat = construct_set_vars_from_flat_op(var_list)
 
-        # sy_stepsize = tf.placeholder(shape=[], dtype=tf.float32)
-        # update_op = tf.train.AdamOptimizer(sy_stepsize).minimize(sy_surr)
-
-        sy_sampled_acs.append(sy_sampled_ac)
-        sy_means.append(sy_mean)
-        sy_logstds.append(sy_logstd)
-        sy_old_means.append(sy_old_mean)
-        sy_old_logstds.append(sy_old_logstd)
-        sy_kls.append(sy_kl)
-        sy_ents.append(sy_ent)
+        sy_sampled_acs += [sy_sampled_ac]
+        sy_means += [sy_mean]
+        sy_logstds += [sy_logstd]
+        sy_old_means += [sy_old_mean]
+        sy_old_logstds += [sy_old_logstd]
+        sy_kls += [sy_kl]
+        sy_ents += [sy_ent]
         sy_surrs += [sy_surr]
         sy_flat_tans += [sy_flat_tan]
-        sy_flat_gvps += [sy_flat_gvp]
+        sy_fisher_vec_prods += [sy_fisher_vec_prod]
         ops_get_vars_flat += [op_get_vars_flat]
         ops_set_vars_from_flat += [op_set_vars_from_flat]
         sy_thetas += [sy_theta]
@@ -295,7 +292,6 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
 
     total_timesteps = 0
     total_episodes = 0
-    stepsizes = [initial_stepsize for _ in range(bootstrap_heads)]
 
     rewards_saved = [initial_reward for _ in range(bootstrap_heads)]
 
@@ -325,8 +321,8 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
                 obs.append(ob)
                 mean, logstd, ac = sess.run([sy_mean, sy_logstd, sy_sampled_ac],
                                             feed_dict={sy_ob: ob[None]})
-                means.append(np.squeeze(mean))
-                ac = np.squeeze(ac)
+                means.append(np.squeeze(mean, axis=0))
+                ac = np.squeeze(ac, axis=0)
                 acs.append(ac)
                 ob, rew, done, _ = env.step(ac)
                 ob = np.squeeze(ob)
@@ -360,7 +356,7 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
             sy_kl = sy_kls[i]
             sy_ent = sy_ents[i]
             sy_flat_tan = sy_flat_tans[i]
-            sy_flat_gvp = sy_flat_gvps[i]
+            sy_fisher_vec_prod = sy_fisher_vec_prods[i]
             sy_surr = sy_surrs[i]
             op_get_vars_flat = ops_get_vars_flat[i]
             op_set_vars_from_flat = ops_set_vars_from_flat[i]
@@ -388,31 +384,32 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
             feed = {
                 sy_ob: ob,
                 sy_ac: ac,
+                sy_adv: standardized_adv,
                 sy_old_mean: old_means,
                 sy_old_logstd: old_logstd,
-                sy_adv: standardized_adv,
             }
 
             def fisher_vector_product(p):
                 feed[sy_flat_tan] = p
-                return sess.run(sy_flat_gvp, feed) + CG_DAMP * p
+                return sy_fisher_vec_prod.eval(feed_dict=feed) + CG_DAMP * p
 
             theta_old = op_get_vars_flat.eval()
-            pg = sy_pg.eval(feed_dict=feed)
-            stepdir = conjugate_gradient(fisher_vector_product, -pg)
-            shs = .5 * stepdir.dot(fisher_vector_product(stepdir))
+            policy_grad = sy_policy_grad.eval(feed_dict=feed)
+            stepdir = conjugate_gradient(fisher_vector_product, -policy_grad)
+
+            shs = 0.5 * stepdir.dot(fisher_vector_product(stepdir))
             lm = np.sqrt(shs / desired_kl)
             fullstep = stepdir / lm
-            neggdotstepdir = -pg.dot(stepdir)
+            neggdotstepdir = -policy_grad.dot(stepdir)
 
-            def loss(theta):
+            def surr_loss(theta):
                 op_set_vars_from_flat.run(feed_dict={sy_theta: theta})
                 return sess.run(sy_surr, feed_dict=feed)
 
-            theta = linesearch(loss, theta_old, fullstep, neggdotstepdir / lm)
-            op_set_vars_from_flat.run(feed_dict={sy_theta: theta})
+            theta_new = linesearch(surr_loss, theta_old, fullstep, neggdotstepdir / lm)
+            op_set_vars_from_flat.run(feed_dict={sy_theta: theta_new})
 
-            lossafter, kl, ent = sess.run([sy_surr, sy_kl, sy_ent], feed_dict=feed)
+            kl, ent = sess.run([sy_kl, sy_ent], feed_dict=feed)
 
             if kl > 2 * desired_kl:  # TODO: ???
                 op_set_vars_from_flat.run(feed_dict={sy_theta: theta_old})
@@ -431,9 +428,8 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
         ob = np.concatenate([path["observation"] for path in paths])
         vtarg = np.concatenate(vtargs)
         vpred = np.concatenate(vpreds)
-        vf.fit(ob, vtarg)  # fit!
         ev_before = explained_variance_1d(vpred, vtarg)
-        ob = np.concatenate([path["observation"] for path in paths])
+        vf.fit(ob, vtarg)  # fit!
         ev_after = explained_variance_1d(np.squeeze(vf.predict(ob)), vtarg)
 
         # Log diagnostics
@@ -454,22 +450,26 @@ def pendulum(logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_bat
 
 
 @click.command()
-@click.option('-k', default=1)
-def main(k):
+@click.option('--env', default='Pendulum-v0')
+@click.option('--gamma', '-g', default=0.99)
+@click.option('--bootstrap-heads', '-k', default=1)
+@click.option('--batch-timesteps', '-t', default=5000)
+@click.option('--desired-kl', default=2e-3)
+def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl):
     pendulum(
+        gym_env=env,
         logdir=osp.join(osp.abspath(__file__), '/log'),
         animate=False,
-        gamma=0.99,
-        bootstrap_heads=k,
-        # min_timesteps_per_batch=20000,
-        min_timesteps_per_batch=25000,
+        gamma=gamma,
+        bootstrap_heads=bootstrap_heads,
+        min_timesteps_per_batch=batch_timesteps,
+        # min_timesteps_per_batch=25000,
         n_iter=1500,
         initial_stepsize=1e-3,
         initial_reward=-650,
         seed=0,
-        # desired_kl=2e-3,
-        desired_kl=0.01,
-        vf_type='nn',
+        desired_kl=desired_kl,
+        vf_type='linear',
         vf_params={}
     )
 

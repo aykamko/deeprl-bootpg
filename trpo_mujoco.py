@@ -1,4 +1,8 @@
 #!/usr/bin/env python3.5
+"""
+Reference implementation: https://github.com/wojzaremba/trpo
+"""
+
 import numpy as np
 import tensorflow as tf
 import gym

@@ -272,15 +272,10 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
             sy_sampled_ac = sy_dist.sample()
 
-            sy_ac_prob = sy_dist.prob(sy_ac)
-            sy_safe_ac_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)  # to avoid log(0) -> nan issues
-            sy_ac_logprob = tf.squeeze(tf.log(sy_safe_ac_prob))  # log-prob of actions taken -- used for policy gradient calculation
+            sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
+            sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
 
-            # sy_old_ac_prob = sy_old_dist.prob(sy_ac)
-            # sy_old_safe_ac_prob = tf.maximum(sy_old_ac_prob, MACHINE_EPS)  # to avoid log(0) -> nan issues
-            # sy_old_ac_logprob = tf.squeeze(tf.log(sy_old_safe_ac_prob))
-
-            sy_surr = -tf.reduce_mean(sy_ac_logprob * sy_adv)
+            sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
 
         var_list = shared_vars + tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=('head%d' % i))
 
@@ -353,7 +348,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
     rew_points, = rew_ax.plot(iter_x, rew_y)
 
     loss_ax.set_title('Loss (After Iteration)')
-    loss_ax.set_ylim(-1e-4, 1e-4)
+    loss_ax.set_ylim(-0.1, 0.1)
     loss_y = []
     loss_points, = loss_ax.plot(iter_x, loss_y)
 

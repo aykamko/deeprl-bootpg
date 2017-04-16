@@ -245,7 +245,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             # sy_old_safe_ac_prob = tf.maximum(sy_old_ac_prob, MACHINE_EPS)  # to avoid log(0) -> nan issues
             # sy_old_ac_logprob = tf.squeeze(tf.log(sy_old_safe_ac_prob))
 
-            sy_surr = -tf.reduce_mean((sy_ac_prob / sy_old_ac_prob) * sy_adv)
+            sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
 
         var_list = shared_vars + tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=('head%d' % i))
 

@@ -10,6 +10,8 @@ import logz
 import scipy.signal
 from os import path as osp
 import click
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 MACHINE_EPS = np.finfo(np.float32).eps
 CG_DAMP = 0.1
@@ -116,7 +118,7 @@ def conjugate_gradient(f_Ax, b, cg_iters=10, residual_tol=1e-10):
     rdotr = r.dot(r)
     for i in range(cg_iters):
         z = f_Ax(p)
-        v = rdotr / p.dot(z)
+        v = rdotr / (p.dot(z) + MACHINE_EPS)
         x += v * p
         r -= v * z
         newrdotr = r.dot(r)
@@ -153,7 +155,7 @@ class LinearValueFunction:
 
 
 class NnValueFunction:
-    def __init__(self, ob_dim, n_epochs=10, stepsize=1e-3):
+    def __init__(self, ob_dim, n_epochs=30, stepsize=1e-3):
         self.ob_dim = ob_dim
         self.n_epochs = n_epochs
         self.stepsize = stepsize
@@ -162,9 +164,9 @@ class NnValueFunction:
     def init_tf(self):
         self.sy_ob = tf.placeholder(shape=[None, self.ob_dim], name='v_ob', dtype=tf.float32)
 
-        sy_h1 = tf.nn.elu(dense(self.sy_ob, 128, "v_h1", weight_init=normc_initializer(1.0)))
-        sy_h2 = tf.nn.elu(dense(sy_h1, 128, "v_h2", weight_init=normc_initializer(1.0)))
-        self.sy_value = dense(sy_h2, 1, 'value', weight_init=normc_initializer(0.1))
+        sy_h1 = tf.nn.elu(dense(self.sy_ob, 64, "v_h1", weight_init=normc_initializer(1.0)))
+        sy_h2 = tf.nn.elu(dense(sy_h1, 64, "v_h2", weight_init=normc_initializer(1.0)))
+        self.sy_value = tf.reshape(dense(sy_h2, 1, 'value', weight_init=normc_initializer(0.1)), [-1])
 
         self.sy_targ_v = tf.placeholder(shape=[None], name='targ_v', dtype=tf.float32)
 
@@ -204,8 +206,8 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         sy_ac = tf.placeholder(shape=[None, ac_dim], name='ac', dtype=tf.float32)  # batch of actions taken by the policy, used for policy gradient computation
         sy_adv = tf.placeholder(shape=[None], name='adv', dtype=tf.float32)  # advantage function estimate
 
-        sy_h1 = lrelu(dense(sy_ob, 128, 'h1', weight_init=normc_initializer(1.0)))
-        sy_h2 = lrelu(dense(sy_h1, 128, 'h2', weight_init=normc_initializer(1.0)))
+        sy_h1 = lrelu(dense(sy_ob, 64, 'h1', weight_init=normc_initializer(1.0)))
+        sy_h2 = lrelu(dense(sy_h1, 64, 'h2', weight_init=normc_initializer(1.0)))
 
     shared_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='shared')
 
@@ -299,8 +301,44 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
     rewards_saved = [initial_reward for _ in range(bootstrap_heads)]
 
-    for i in range(n_iter):
-        print("********** Iteration %i ************" % i)
+    fig, axes = plt.subplots(5, 1, figsize=(8, 8))
+    rew_ax, loss_ax, kl_ax, ent_ax, ev_ax = axes
+
+    for ax in axes:
+        ax.set_xlim(0, 50)
+
+    iter_x = []
+
+    rew_ax.set_title('Average Reward')
+    rew_ax.set_ylim(-2e3, 1e3)
+    rew_y = []
+    rew_points, = rew_ax.plot(iter_x, rew_y)
+
+    loss_ax.set_title('Loss (After Iteration)')
+    loss_ax.set_ylim(-1e-4, 1e-4)
+    loss_y = []
+    loss_points, = loss_ax.plot(iter_x, loss_y)
+
+    kl_ax.set_title('Max KL')
+    kl_ax.set_ylim(0, 2*desired_kl)
+    kl_y = []
+    kl_points, = kl_ax.plot(iter_x, kl_y)
+
+    ent_ax.set_title('Average Entropy')
+    ent_ax.set_ylim(0, 3)
+    ent_y = []
+    ent_points, = ent_ax.plot(iter_x, ent_y)
+
+    ev_ax.set_title('Explained Variance, Before and After')
+    ev_ax.set_ylim(-1, 1)
+    ev_before_y, ev_after_y = [], []
+    ev_before_points, = ev_ax.plot(iter_x, ev_before_y)
+    ev_after_points, = ev_ax.plot(iter_x, ev_after_y)
+
+    plt.ion()
+
+    for iter_i in range(n_iter):
+        print("********** Iteration %i ************" % iter_i)
 
         # Randomly sample a bootstrap head
         # bootstrap_i = np.random.randint(bootstrap_heads)
@@ -413,7 +451,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             theta_new = linesearch(surr_loss, theta_old, fullstep, neggdotstepdir / lm)
             op_set_vars_from_flat.run(feed_dict={sy_theta: theta_new})
 
-            kl, ent = sess.run([sy_kl, sy_ent], feed_dict=feed)
+            surr_after, kl, ent = sess.run([sy_surr, sy_kl, sy_ent], feed_dict=feed)
 
             if kl > 2 * desired_kl:  # TODO: ???
                 op_set_vars_from_flat.run(feed_dict={sy_theta: theta_old})
@@ -438,12 +476,14 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
         # Log diagnostics
         logz.log_tabular("Head", bootstrap_i)
-        logz.log_tabular("EpRewMean", np.mean([path["reward"].sum() for path in paths]))
+        ep_rew_mean = np.mean([path["reward"].sum() for path in paths])
+        logz.log_tabular("EpRewMean", ep_rew_mean)
         logz.log_tabular("EpLenMean", np.mean([pathlength(path) for path in paths]))
         logz.log_tabular("MaxKLOldNew", max_kl)
         logz.log_tabular("AvgEntropy", avg_ent)
         logz.log_tabular("EVBefore", ev_before)
         logz.log_tabular("EVAfter", ev_after)
+        logz.log_tabular("SurrAfter", surr_after)
         logz.log_tabular("TimestepsSoFar", total_timesteps)
         logz.log_tabular("EpisodesSoFar", total_episodes)
         logz.log_tabular("BatchTimesteps", timesteps_this_batch)
@@ -452,13 +492,35 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         # Note that we fit value function AFTER using it to compute the advantage function to avoid introducing bias
         logz.dump_tabular()
 
+        # plot in real time
+        iter_x += [iter_i]
+
+        rew_y += [ep_rew_mean]
+        rew_points.set_data(iter_x, rew_y)
+
+        loss_y += [surr_after]
+        loss_points.set_data(iter_x, loss_y)
+
+        kl_y += [max_kl]
+        kl_points.set_data(iter_x, kl_y)
+
+        ent_y += [avg_ent]
+        ent_points.set_data(iter_x, ent_y)
+
+        ev_before_y += [ev_before]
+        ev_after_y += [ev_after]
+        ev_before_points.set_data(iter_x, ev_before_y)
+        ev_after_points.set_data(iter_x, ev_after_y)
+
+        plt.pause(0.05)
+
 
 @click.command()
 @click.option('--env', default='Pendulum-v0')
 @click.option('--gamma', '-g', default=0.99)
 @click.option('--bootstrap-heads', '-k', default=1)
-@click.option('--batch-timesteps', '-t', default=5000)
-@click.option('--desired-kl', default=2e-3)
+@click.option('--batch-timesteps', '-t', default=2500)
+@click.option('--desired-kl', default=5e-3)
 def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl):
     pendulum(
         gym_env=env,
@@ -473,7 +535,7 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl):
         initial_reward=-650,
         seed=0,
         desired_kl=desired_kl,
-        vf_type='linear',
+        vf_type='nn',
         vf_params={}
     )
 

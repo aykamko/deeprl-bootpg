@@ -13,8 +13,32 @@ import click
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+
 MACHINE_EPS = np.finfo(np.float32).eps
 CG_DAMP = 0.1
+ROLL_MEM_SIZE = 1000
+
+
+class RollingMem:
+    def __init__(self, maxlen=ROLL_MEM_SIZE):
+        self.maxlen = maxlen
+        self.mem = []
+
+    def append(self, val):
+        if len(self.mem) < self.maxlen:
+            self.mem += [val]
+        else:
+            self.mem[:-1] = self.mem[1:]
+            self.mem[-1] = val
+
+    def mean(self):
+        return np.mean(self.mem)
+
+    def std(self):
+        return np.std(self.mem)
+
+    def standardize(self, val):
+        return (val - self.mean()) / (self.std() + MACHINE_EPS)
 
 
 def discount(x, gamma):
@@ -97,12 +121,16 @@ def construct_set_vars_from_flat_op(var_list):
 
 
 def linesearch(f, x, fullstep, expected_improve_rate):
-    accept_ratio = .1
+    accept_ratio = 0.1
     max_backtracks = 10
     fval = f(x)
-    for _n_backtracks, stepfrac in enumerate(.5**np.arange(max_backtracks)):
+    for step_i, stepfrac in enumerate(0.5 ** np.arange(max_backtracks)):
         xnew = x + stepfrac * fullstep
-        newfval = f(xnew)
+        try:
+            newfval = f(xnew)
+        except Exception:
+            print('linesearch stepfrac {} caused except!'.format(stepfrac))
+            continue
         actual_improve = fval - newfval
         expected_improve = expected_improve_rate * stepfrac
         ratio = actual_improve / expected_improve
@@ -118,7 +146,7 @@ def conjugate_gradient(f_Ax, b, cg_iters=10, residual_tol=1e-10):
     rdotr = r.dot(r)
     for i in range(cg_iters):
         z = f_Ax(p)
-        v = rdotr / (p.dot(z) + MACHINE_EPS)
+        v = rdotr / p.dot(z)
         x += v * p
         r -= v * z
         newrdotr = r.dot(r)
@@ -230,6 +258,11 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             sy_mean = dense(sy_h2, ac_dim, 'mean', weight_init=normc_initializer(0.1))  # Mean control output
             sy_logstd = tf.get_variable('logstd', [ac_dim], initializer=tf.zeros_initializer())  # Variance
             sy_std = tf.exp(sy_logstd)
+
+            sy_std = tf.cond(
+                tf.squeeze(tf.logical_or(sy_std <= 0, tf.is_nan(sy_std))),
+                lambda: tf.Print(sy_std, [sy_mean], 'sy_std is bad!'),
+                lambda: sy_std)
             sy_dist = tf.contrib.distributions.Normal(mu=sy_mean, sigma=sy_std, validate_args=True)
 
             sy_old_mean = tf.placeholder(shape=[None, ac_dim], name='oldmean', dtype=tf.float32)
@@ -240,14 +273,14 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             sy_sampled_ac = sy_dist.sample()
 
             sy_ac_prob = sy_dist.prob(sy_ac)
-            # sy_safe_ac_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)  # to avoid log(0) -> nan issues
-            # sy_ac_logprob = tf.squeeze(tf.log(sy_safe_ac_prob))  # log-prob of actions taken -- used for policy gradient calculation
+            sy_safe_ac_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)  # to avoid log(0) -> nan issues
+            sy_ac_logprob = tf.squeeze(tf.log(sy_safe_ac_prob))  # log-prob of actions taken -- used for policy gradient calculation
 
-            sy_old_ac_prob = sy_old_dist.prob(sy_ac)
+            # sy_old_ac_prob = sy_old_dist.prob(sy_ac)
             # sy_old_safe_ac_prob = tf.maximum(sy_old_ac_prob, MACHINE_EPS)  # to avoid log(0) -> nan issues
             # sy_old_ac_logprob = tf.squeeze(tf.log(sy_old_safe_ac_prob))
 
-            sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
+            sy_surr = -tf.reduce_mean(sy_ac_logprob * sy_adv)
 
         var_list = shared_vars + tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=('head%d' % i))
 
@@ -304,8 +337,13 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
     fig, axes = plt.subplots(5, 1, figsize=(8, 8))
     rew_ax, loss_ax, kl_ax, ent_ax, ev_ax = axes
 
-    for ax in axes:
-        ax.set_xlim(0, 50)
+    x_start = 0
+    x_end = 50
+
+    def set_xbounds():
+        for ax in axes:
+            ax.set_xlim(x_start, x_end)
+    set_xbounds()
 
     iter_x = []
 
@@ -337,6 +375,8 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
     plt.ion()
 
+    # ob_memory = RollingMem(ROLL_MEM_SIZE)
+
     for iter_i in range(n_iter):
         print("********** Iteration %i ************" % iter_i)
 
@@ -360,14 +400,21 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             while True:
                 if animate_this_episode:
                     env.render()
+
+                # ob_memory.append(ob)
+                # std_ob = ob_memory.standardize(ob)
+                # obs.append(std_ob)
                 obs.append(ob)
+
                 mean, logstd, ac = sess.run([sy_mean, sy_logstd, sy_sampled_ac],
                                             feed_dict={sy_ob: ob[None]})
+
                 means.append(np.squeeze(mean, axis=0))
                 ac = np.squeeze(ac, axis=0)
                 acs.append(ac)
                 ob, rew, done, _ = env.step(ac)
                 ob = np.squeeze(ob)
+
                 rewards.append(rew)
                 if done:
                     break
@@ -439,7 +486,8 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             policy_grad = sy_policy_grad.eval(feed_dict=feed)
             stepdir = conjugate_gradient(fisher_vector_product, -policy_grad)
 
-            shs = 0.5 * stepdir.dot(fisher_vector_product(stepdir))
+            fvp = fisher_vector_product(stepdir)
+            shs = 0.5 * stepdir.dot(fvp)
             lm = np.sqrt(shs / desired_kl)
             fullstep = stepdir / lm
             neggdotstepdir = -policy_grad.dot(stepdir)
@@ -511,6 +559,11 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         ev_after_y += [ev_after]
         ev_before_points.set_data(iter_x, ev_before_y)
         ev_after_points.set_data(iter_x, ev_after_y)
+
+        if iter_i > 45:
+            x_start += 1
+            x_end += 1
+            set_xbounds()
 
         plt.pause(0.05)
 

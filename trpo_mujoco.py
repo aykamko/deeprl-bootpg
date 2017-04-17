@@ -345,9 +345,9 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
     rewards_saved = [initial_reward for _ in range(bootstrap_heads)]
 
     # ----- PLOTTING
-    fig, axes = plt.subplots(5, 1, figsize=(7, 8))
-    rew_ax, loss_ax, kl_ax, ent_ax, ev_ax = axes
-    plt.tight_layout(pad=1.0, h_pad=1.5)
+    fig, axes = plt.subplots(4, 1, figsize=(7, 8))
+    rew_ax, loss_ax, kl_ax, ev_ax = axes
+    plt.tight_layout(pad=2.0, h_pad=1.5)
 
     x_start = 0
     x_end = 50
@@ -357,7 +357,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             ax.set_xlim(x_start, x_end)
     set_xbounds()
 
-    rew_ax.set_title('Average Reward')
+    rew_ax.set_title('Average Reward (Rollout Head)')
     rew_ax.set_ylim(-1.5e3, 0)
     rew_y_by_head = []
     rew_x_by_head = []
@@ -371,8 +371,8 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
     iter_x = []
 
-    loss_ax.set_title('Loss (After Iteration)')
-    loss_ax.set_ylim(-0.1, 0.1)
+    loss_ax.set_title('Loss (After train iteration, by head)')
+    loss_ax.set_ylim(-0.04, 0.04)
     loss_y_by_head, loss_points_by_head = [], []
     for i in range(bootstrap_heads):
         loss_y = []
@@ -380,7 +380,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         loss_points, = loss_ax.plot(iter_x, loss_y)
         loss_points_by_head += [loss_points]
 
-    kl_ax.set_title('Max KL')
+    kl_ax.set_title('KL')
     kl_ax.set_ylim(0, 2*desired_kl)
     kl_y_by_head, kl_points_by_head = [], []
     for i in range(bootstrap_heads):
@@ -389,12 +389,12 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         kl_points, = kl_ax.plot(iter_x, kl_y)
         kl_points_by_head += [kl_points]
 
-    ent_ax.set_title('Average Entropy')
-    ent_ax.set_ylim(0, 3)
-    ent_y = []
-    ent_points, = ent_ax.plot(iter_x, ent_y)
+    # ent_ax.set_title('Average Entropy')
+    # ent_ax.set_ylim(0, 3)
+    # ent_y = []
+    # ent_points, = ent_ax.plot(iter_x, ent_y)
 
-    ev_ax.set_title('Explained Variance, Before and After')
+    ev_ax.set_title('Explained Variance (After update, by head)')
     ev_ax.set_ylim(-1, 1)
     ev_y_by_head, ev_points_by_head = [], []
     for i in range(bootstrap_heads):
@@ -485,6 +485,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
                 vtargs.append(discount(path["reward"], gamma))
                 rew_t = path["reward"]
                 return_t = discount(rew_t, gamma)
+                # TODO: use rollout vf or this head's vf? former seems to do a bit better?
                 baseline_t = rollout_vf.predict(path["observation"])
                 baselines.append(baseline_t)
                 adv_t = return_t - baseline_t
@@ -535,7 +536,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             theta_new, step_taken = linesearch(
                 surr_loss, theta_old, fullstep, neggdotstepdir / lamb, i, smallest=False)
 
-            # compute means and std using this heads parameters for measuring KL
+            # measure KL old-new with this heads parameters (not with rollout head params)
             feed[sy_old_mean] = this_head_old_means
             feed[sy_old_logstd] = this_head_old_logstd
             op_set_vars_from_flat.run(feed_dict={sy_theta: theta_new})
@@ -588,8 +589,8 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         rew_x += [iter_i]
         rew_y += [ep_rew_mean]
         rew_points_by_head[bootstrap_i].set_data(rew_x, rew_y)
-        ent_y += [avg_ent]
-        ent_points.set_data(iter_x, ent_y)
+        # ent_y += [avg_ent]
+        # ent_points.set_data(iter_x, ent_y)
 
         if iter_i > 45:
             x_start += 1
@@ -606,7 +607,8 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 @click.option('--bootstrap-heads', '-k', default=1)
 @click.option('--batch-timesteps', '-t', default=2500)
 @click.option('--desired-kl', default=2e-3)
-def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl):
+@click.option('--n-iter', default=400)
+def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter):
     pendulum(
         gym_env=env,
         logdir=osp.join(osp.abspath(__file__), '/log'),
@@ -615,7 +617,7 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl):
         bootstrap_heads=bootstrap_heads,
         min_timesteps_per_batch=(bootstrap_heads * batch_timesteps),
         # min_timesteps_per_batch=25000,
-        n_iter=1000,
+        n_iter=400,
         initial_stepsize=1e-3,
         initial_reward=-650,
         seed=0,

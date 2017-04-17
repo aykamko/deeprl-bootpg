@@ -124,9 +124,11 @@ def linesearch(f, x, fullstep, expected_improve_rate, head_i, smallest=False):
     accept_ratio = 0.1
     max_backtracks = 30
     fval = f(x)
+
     search_space = enumerate(0.5 ** np.arange(max_backtracks))
     if smallest:
         search_space = reversed(list(search_space))
+
     for step_i, stepfrac in search_space:
         step = stepfrac * fullstep
         xnew = x + step
@@ -139,7 +141,7 @@ def linesearch(f, x, fullstep, expected_improve_rate, head_i, smallest=False):
         expected_improve = expected_improve_rate * stepfrac
         ratio = actual_improve / expected_improve
         if ratio > accept_ratio and actual_improve > 0:
-            print(head_i, 'linesearch chose', step_i)
+            print(head_i, 'i/a/e/r/f', step_i, actual_improve, expected_improve, ratio, newfval)
             return xnew, step
     return x, 0
 
@@ -229,10 +231,15 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
     ac_dim = env.action_space.shape[0]
     print("ob_dim is:", ob_dim)
     print("ac_dim is:", ac_dim)
-    vf = {
-        'linear': LinearValueFunction,
-        'nn': NnValueFunction,
-    }[vf_type](ob_dim, **vf_params)
+
+    vfs = []
+    for i in range(bootstrap_heads):
+        with tf.variable_scope('value_head%d' % i):
+            vf = {
+                'linear': LinearValueFunction,
+                'nn': NnValueFunction,
+            }[vf_type](ob_dim, **vf_params)
+            vfs += [vf]
 
     with tf.variable_scope('shared'):
         sy_ob = tf.placeholder(shape=[None, ob_dim], name='ob', dtype=tf.float32)  # batch of observations
@@ -259,9 +266,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
     ops_set_vars_from_flat = []
     sy_thetas = []
 
-    sy_kl_unscaleds = []
-    pls = []
-
     for i in range(bootstrap_heads):
         with tf.variable_scope('head%d' % i):
             sy_mean = dense(sy_h2, ac_dim, 'mean%d' % i, weight_init=normc_initializer(0.1))  # Mean control output
@@ -278,27 +282,18 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
             sy_sampled_ac = sy_dist.sample()
 
-            # sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
-            # sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
-            #
-            # sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
-
             sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
-            sy_ac_safe_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)
-            sy_ac_logprob = tf.log(sy_ac_safe_prob)
+            sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
+            sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
 
-            sy_surr = -tf.reduce_mean(sy_ac_logprob * sy_adv)
+            # sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
+            # sy_ac_safe_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)
+            # sy_ac_logprob = tf.log(sy_ac_safe_prob)
+            # sy_surr = -tf.reduce_mean(sy_ac_logprob * sy_adv)
 
             var_list = shared_vars + tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=('head%d' % i))
 
-            pls += [[
-                sy_dist.loc,
-                sy_dist.scale,
-                sy_old_dist.loc,
-                sy_old_dist.scale,
-            ]]
-            sy_kl_unscaled = tf.contrib.distributions.kl(sy_old_dist, sy_dist)
-            sy_kl = tf.reduce_mean(sy_kl_unscaled)
+            sy_kl = tf.reduce_mean(tf.contrib.distributions.kl(sy_old_dist, sy_dist))
             sy_ent = tf.reduce_mean(sy_dist.entropy())
 
             sy_policy_grad = flatgrad(sy_surr, var_list)
@@ -339,8 +334,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         ops_get_vars_flat += [op_get_vars_flat]
         ops_set_vars_from_flat += [op_set_vars_from_flat]
         sy_thetas += [sy_theta]
-
-        sy_kl_unscaleds += [sy_kl_unscaled]
 
     sess = tf.Session()
     sess.__enter__()  # equivalent to `with sess:`
@@ -403,9 +396,12 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
     ev_ax.set_title('Explained Variance, Before and After')
     ev_ax.set_ylim(-1, 1)
-    ev_before_y, ev_after_y = [], []
-    ev_before_points, = ev_ax.plot(iter_x, ev_before_y)
-    ev_after_points, = ev_ax.plot(iter_x, ev_after_y)
+    ev_y_by_head, ev_points_by_head = [], []
+    for i in range(bootstrap_heads):
+        ev_y = []
+        ev_y_by_head += [ev_y]
+        ev_points, = ev_ax.plot(iter_x, ev_y)
+        ev_points_by_head += [ev_points]
 
     plt.ion()
     # ----- PLOTTING
@@ -480,15 +476,18 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             op_get_vars_flat = ops_get_vars_flat[i]
             op_set_vars_from_flat = ops_set_vars_from_flat[i]
             sy_theta = sy_thetas[i]
+            vf = vfs[i]
 
             # Estimate advantage function
-            advs = []
+            vtargs, baselines, advs = [], [], []
             for path in paths:
                 if not path["mask"][i]:
                     continue
+                vtargs.append(discount(path["reward"], gamma))
                 rew_t = path["reward"]
                 return_t = discount(rew_t, gamma)
                 baseline_t = vf.predict(path["observation"])
+                baselines.append(baseline_t)
                 adv_t = return_t - baseline_t
                 advs.append(adv_t)
 
@@ -497,6 +496,11 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             ac = np.concatenate([path["action"] for path in paths if path["mask"][i]])
             adv = np.concatenate(advs)
             standardized_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+            # Fit value function
+            vtarg = np.concatenate(vtargs)
+            vf.fit(ob, vtarg)  # fit!
+            ev_after = explained_variance_1d(np.squeeze(vf.predict(ob)), vtarg)
 
             old_logstd = sy_logstd.eval()
             old_means = sess.run(sy_mean, feed_dict={sy_ob: ob})
@@ -519,8 +523,9 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
             fvp = fisher_vector_product(stepdir)
             shs = 0.5 * stepdir.dot(fvp)
-            lm = np.sqrt(shs / desired_kl)
-            fullstep = stepdir / lm
+            lamb = np.sqrt(shs / desired_kl)
+            print(i, 'lamb:', lamb, 'pg_norm:', np.linalg.norm(policy_grad))
+            fullstep = stepdir / lamb
             neggdotstepdir = -policy_grad.dot(stepdir)
 
             def surr_loss(theta):
@@ -528,7 +533,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
                 return sess.run(sy_surr, feed_dict=feed)
 
             theta_new, step_taken = linesearch(
-                surr_loss, theta_old, fullstep, neggdotstepdir / lm, i, smallest=False)
+                surr_loss, theta_old, fullstep, neggdotstepdir / lamb, i, smallest=False)
 
             op_set_vars_from_flat.run(feed_dict={sy_theta: theta_new})
             surr_after, kl, ent = sess.run([sy_surr, sy_kl, sy_ent], feed_dict=feed)
@@ -545,6 +550,9 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             kl_y = kl_y_by_head[i]
             kl_y += [kl]
             kl_points_by_head[i].set_data(iter_x, kl_y)
+            ev_y = ev_y_by_head[i]
+            ev_y += [ev_after]
+            ev_points_by_head[i].set_data(iter_x, ev_y)
             # ----- PLOTTING
 
             max_kl = max(max_kl, kl)
@@ -553,18 +561,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         avg_ent /= bootstrap_heads
         rewards_saved[bootstrap_i] = np.mean([path["reward"].sum() for path in paths])
 
-        # Fit value function
-        vtargs, vpreds = [], []
-        for path in paths:
-            vtargs.append(discount(path["reward"], gamma))
-            vpreds.append(vf.predict(path["observation"]))
-        ob = np.concatenate([path["observation"] for path in paths])
-        vtarg = np.concatenate(vtargs)
-        vpred = np.concatenate(vpreds)
-        ev_before = explained_variance_1d(vpred, vtarg)
-        vf.fit(ob, vtarg)  # fit!
-        ev_after = explained_variance_1d(np.squeeze(vf.predict(ob)), vtarg)
-
         # Log diagnostics
         logz.log_tabular("Head", bootstrap_i)
         ep_rew_mean = np.mean([path["reward"].sum() for path in paths])
@@ -572,8 +568,8 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         logz.log_tabular("EpLenMean", np.mean([pathlength(path) for path in paths]))
         logz.log_tabular("MaxKLOldNew", max_kl)
         logz.log_tabular("AvgEntropy", avg_ent)
-        logz.log_tabular("EVBefore", ev_before)
-        logz.log_tabular("EVAfter", ev_after)
+        # logz.log_tabular("EVBefore", ev_before)
+        # logz.log_tabular("EVAfter", ev_after)
         logz.log_tabular("SurrAfter", surr_after)
         logz.log_tabular("TimestepsSoFar", total_timesteps)
         logz.log_tabular("EpisodesSoFar", total_episodes)
@@ -591,10 +587,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         rew_points_by_head[bootstrap_i].set_data(rew_x, rew_y)
         ent_y += [avg_ent]
         ent_points.set_data(iter_x, ent_y)
-        ev_before_y += [ev_before]
-        ev_after_y += [ev_after]
-        ev_before_points.set_data(iter_x, ev_before_y)
-        ev_after_points.set_data(iter_x, ev_after_y)
 
         if iter_i > 45:
             x_start += 1
@@ -610,7 +602,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 @click.option('--gamma', '-g', default=0.99)
 @click.option('--bootstrap-heads', '-k', default=1)
 @click.option('--batch-timesteps', '-t', default=2500)
-@click.option('--desired-kl', default=5e-3)
+@click.option('--desired-kl', default=2e-3)
 def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl):
     pendulum(
         gym_env=env,
@@ -618,9 +610,9 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl):
         animate=False,
         gamma=gamma,
         bootstrap_heads=bootstrap_heads,
-        min_timesteps_per_batch=batch_timesteps,
+        min_timesteps_per_batch=(bootstrap_heads * batch_timesteps),
         # min_timesteps_per_batch=25000,
-        n_iter=(bootstrap_heads * 1500),
+        n_iter=1000,
         initial_stepsize=1e-3,
         initial_reward=-650,
         seed=0,

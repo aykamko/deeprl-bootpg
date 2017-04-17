@@ -416,9 +416,10 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         sy_sampled_ac = sy_sampled_acs[bootstrap_i]
         sy_mean = sy_means[bootstrap_i]
         sy_logstd = sy_logstds[bootstrap_i]
-        old_logstd = sy_logstd.eval()
+        rollout_vf = vfs[bootstrap_i]
 
         # Collect paths until we have enough timesteps
+        old_logstd = sy_logstd.eval()
         timesteps_this_batch = 0
         episodes_this_batch = 0
         paths = []
@@ -463,8 +464,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         max_kl = -np.inf
         avg_ent = 0
         for i in range(bootstrap_heads):
-            sy_mean = sy_means[i]
-            sy_logstd = sy_logstds[i]
             sy_old_mean = sy_old_means[i]
             sy_old_logstd = sy_old_logstds[i]
             sy_kl = sy_kls[i]
@@ -486,7 +485,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
                 vtargs.append(discount(path["reward"], gamma))
                 rew_t = path["reward"]
                 return_t = discount(rew_t, gamma)
-                baseline_t = vf.predict(path["observation"])
+                baseline_t = rollout_vf.predict(path["observation"])
                 baselines.append(baseline_t)
                 adv_t = return_t - baseline_t
                 advs.append(adv_t)
@@ -494,6 +493,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             # Build arrays for policy update
             ob = np.concatenate([path["observation"] for path in paths if path["mask"][i]])
             ac = np.concatenate([path["action"] for path in paths if path["mask"][i]])
+            old_means = np.concatenate([path["dist_means"] for path in paths if path["mask"][i]])
             adv = np.concatenate(advs)
             standardized_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
@@ -502,9 +502,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             vf.fit(ob, vtarg)  # fit!
             ev_after = explained_variance_1d(np.squeeze(vf.predict(ob)), vtarg)
 
-            old_logstd = sy_logstd.eval()
-            old_means = sess.run(sy_mean, feed_dict={sy_ob: ob})
-
             feed = {
                 sy_ob: ob,
                 sy_ac: ac,
@@ -512,6 +509,9 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
                 sy_old_mean: old_means,
                 sy_old_logstd: old_logstd,
             }
+
+            this_head_old_means = sy_means[i].eval(feed_dict={sy_ob: ob})
+            this_head_old_logstd = sy_logstds[i].eval()
 
             def fisher_vector_product(p):
                 feed[sy_flat_tan] = p
@@ -535,6 +535,9 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             theta_new, step_taken = linesearch(
                 surr_loss, theta_old, fullstep, neggdotstepdir / lamb, i, smallest=False)
 
+            # compute means and std using this heads parameters for measuring KL
+            feed[sy_old_mean] = this_head_old_means
+            feed[sy_old_logstd] = this_head_old_logstd
             op_set_vars_from_flat.run(feed_dict={sy_theta: theta_new})
             surr_after, kl, ent = sess.run([sy_surr, sy_kl, sy_ent], feed_dict=feed)
             if kl > 2 * desired_kl:

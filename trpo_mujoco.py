@@ -274,16 +274,16 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
             sy_sampled_ac = sy_dist.sample()
 
-            # sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
-            # sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
-            #
-            # sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
-
             sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
-            sy_ac_safe_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)
-            sy_ac_logprob = tf.log(sy_ac_safe_prob)
+            sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
 
-            sy_surr = -tf.reduce_mean(sy_ac_logprob * sy_adv)
+            sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
+
+            # sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
+            # sy_ac_safe_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)
+            # sy_ac_logprob = tf.log(sy_ac_safe_prob)
+            #
+            # sy_surr = -tf.reduce_mean(sy_ac_logprob * sy_adv)
 
         var_list = shared_vars + tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=('head%d' % i))
 
@@ -352,7 +352,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
     set_xbounds()
 
     rew_ax.set_title('Average Reward')
-    rew_ax.set_ylim(-2e3, 1e3)
+    rew_ax.set_ylim(-1.5e3, 0)
     rew_y_by_head = []
     rew_x_by_head = []
     rew_points_by_head = []
@@ -360,7 +360,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         rew_y, rew_x = [], []
         rew_y_by_head += [rew_y]
         rew_x_by_head += [rew_x]
-        rew_points, = rew_ax.plot(rew_x, rew_y)
+        rew_points, = rew_ax.plot(rew_x, rew_y, marker='.')
         rew_points_by_head += [rew_points]
 
     iter_x = []
@@ -454,6 +454,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         max_kl = -np.inf
         avg_ent = 0
         for i in range(bootstrap_heads):
+            sy_logstd = sy_logstds[i]
             sy_old_mean = sy_old_means[i]
             sy_old_logstd = sy_old_logstds[i]
             sy_kl = sy_kls[i]
@@ -480,9 +481,12 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             # Build arrays for policy update
             ob = np.concatenate([path["observation"] for path in paths if path["mask"][i]])
             ac = np.concatenate([path["action"] for path in paths if path["mask"][i]])
-            old_means = np.concatenate([path["dist_means"] for path in paths if path["mask"][i]])
+            # old_means = np.concatenate([path["dist_means"] for path in paths if path["mask"][i]])
             adv = np.concatenate(advs)
             standardized_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+            old_logstd = sy_logstd.eval()
+            old_means = sess.run(sy_mean, feed_dict={sy_ob: ob})
 
             feed = {
                 sy_ob: ob,
@@ -510,11 +514,16 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
                 op_set_vars_from_flat.run(feed_dict={sy_theta: theta})
                 return sess.run(sy_surr, feed_dict=feed)
 
+            # theta_new, step_taken = linesearch(
+            #     surr_loss, theta_old, fullstep, neggdotstepdir / lm, i, smallest=i != bootstrap_i)
             theta_new, step_taken = linesearch(
-                surr_loss, theta_old, fullstep, neggdotstepdir / lm, i, i != bootstrap_i)
+                surr_loss, theta_old, fullstep, neggdotstepdir / lm, i, smallest=False)
 
             op_set_vars_from_flat.run(feed_dict={sy_theta: theta_new})
             surr_after, kl, ent = sess.run([sy_surr, sy_kl, sy_ent], feed_dict=feed)
+            # if kl > 2 * desired_kl:
+            #     op_set_vars_from_flat.run(feed_dict={sy_theta: theta_old})
+            #     print(i, 'no update')
             # if kl > 10 * desired_kl or (i == bootstrap_i and kl > 2 * desired_kl):
             #     import ipdb; ipdb.set_trace()
             #     for j in range(10):

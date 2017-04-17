@@ -128,7 +128,8 @@ def linesearch(f, x, fullstep, expected_improve_rate, head_i, smallest=False):
     if smallest:
         search_space = reversed(list(search_space))
     for step_i, stepfrac in search_space:
-        xnew = x + stepfrac * fullstep
+        step = stepfrac * fullstep
+        xnew = x + step
         try:
             newfval = f(xnew)
         except Exception:
@@ -139,7 +140,7 @@ def linesearch(f, x, fullstep, expected_improve_rate, head_i, smallest=False):
         ratio = actual_improve / expected_improve
         if ratio > accept_ratio and actual_improve > 0:
             print(head_i, 'linesearch chose', step_i)
-            return xnew, stepfrac * fullstep
+            return xnew, step
     return x, 0
 
 
@@ -273,10 +274,16 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
             sy_sampled_ac = sy_dist.sample()
 
-            sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
-            sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
+            # sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
+            # sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
+            #
+            # sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
 
-            sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
+            sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
+            sy_ac_safe_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)
+            sy_ac_logprob = tf.log(sy_ac_safe_prob)
+
+            sy_surr = -tf.reduce_mean(sy_ac_logprob * sy_adv)
 
         var_list = shared_vars + tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=('head%d' % i))
 
@@ -505,13 +512,27 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
             theta_new, step_taken = linesearch(
                 surr_loss, theta_old, fullstep, neggdotstepdir / lm, i, i != bootstrap_i)
+
+            op_set_vars_from_flat.run(feed_dict={sy_theta: theta_new})
+            surr_after, kl, ent = sess.run([sy_surr, sy_kl, sy_ent], feed_dict=feed)
+            # if kl > 10 * desired_kl or (i == bootstrap_i and kl > 2 * desired_kl):
+            #     import ipdb; ipdb.set_trace()
+            #     for j in range(10):
+            #         step_taken /= 2
+            #         theta_new = theta_old + step_taken
+            #         op_set_vars_from_flat.run(feed_dict={sy_theta: theta_new})
+            #         surr_after, kl, ent = sess.run([sy_surr, sy_kl, sy_ent], feed_dict=feed)
+            #         if not (kl > 10 * desired_kl or (i == bootstrap_i and kl > 2 * desired_kl)):
+            #             print(i, 'adjusted at', j)
+            #             break
+            #     else:
+            #         op_set_vars_from_flat.run(feed_dict={sy_theta: theta_old})
+            #         print(i, 'no update')
+
             if i != bootstrap_i:
                 print(i,
                       'fullstep norm', np.linalg.norm(fullstep),
                       'step_taken norm', np.linalg.norm(step_taken))
-            op_set_vars_from_flat.run(feed_dict={sy_theta: theta_new})
-
-            surr_after, kl, ent = sess.run([sy_surr, sy_kl, sy_ent], feed_dict=feed)
 
             # ----- PLOTTING
             loss_y = loss_y_by_head[i]
@@ -521,9 +542,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             kl_y += [kl]
             kl_points_by_head[i].set_data(iter_x, kl_y)
             # ----- PLOTTING
-
-            # if (i == bootstrap_i and kl > 2 * desired_kl) or kl > 10 * desired_kl:
-            #     op_set_vars_from_flat.run(feed_dict={sy_theta: theta_old})
 
             max_kl = max(max_kl, kl)
             avg_ent += ent

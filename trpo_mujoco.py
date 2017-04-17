@@ -120,11 +120,14 @@ def construct_set_vars_from_flat_op(var_list):
     return sy_theta, tf.group(*assign_ops)
 
 
-def linesearch(f, x, fullstep, expected_improve_rate):
+def linesearch(f, x, fullstep, expected_improve_rate, head_i, smallest=False):
     accept_ratio = 0.1
-    max_backtracks = 10
+    max_backtracks = 30
     fval = f(x)
-    for step_i, stepfrac in enumerate(0.5 ** np.arange(max_backtracks)):
+    search_space = enumerate(0.5 ** np.arange(max_backtracks))
+    if smallest:
+        search_space = reversed(list(search_space))
+    for step_i, stepfrac in search_space:
         xnew = x + stepfrac * fullstep
         try:
             newfval = f(xnew)
@@ -135,8 +138,9 @@ def linesearch(f, x, fullstep, expected_improve_rate):
         expected_improve = expected_improve_rate * stepfrac
         ratio = actual_improve / expected_improve
         if ratio > accept_ratio and actual_improve > 0:
-            return xnew
-    return x
+            print(head_i, 'linesearch chose', step_i)
+            return xnew, stepfrac * fullstep
+    return x, 0
 
 
 def conjugate_gradient(f_Ax, b, cg_iters=10, residual_tol=1e-10):
@@ -246,6 +250,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
     sy_old_logstds = []
     sy_kls = []
     sy_ents = []
+    sy_policy_grads = []
     sy_surrs = []
     sy_flat_tans = []
     sy_fisher_vec_prods = []
@@ -259,10 +264,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             sy_logstd = tf.get_variable('logstd', [ac_dim], initializer=tf.zeros_initializer())  # Variance
             sy_std = tf.exp(sy_logstd)
 
-            sy_std = tf.cond(
-                tf.squeeze(tf.logical_or(sy_std <= 0, tf.is_nan(sy_std))),
-                lambda: tf.Print(sy_std, [sy_mean], 'sy_std is bad!'),
-                lambda: sy_std)
             sy_dist = tf.contrib.distributions.Normal(mu=sy_mean, sigma=sy_std, validate_args=True)
 
             sy_old_mean = tf.placeholder(shape=[None, ac_dim], name='oldmean', dtype=tf.float32)
@@ -313,6 +314,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         sy_old_logstds += [sy_old_logstd]
         sy_kls += [sy_kl]
         sy_ents += [sy_ent]
+        sy_policy_grads += [sy_policy_grad]
         sy_surrs += [sy_surr]
         sy_flat_tans += [sy_flat_tan]
         sy_fisher_vec_prods += [sy_fisher_vec_prod]
@@ -329,8 +331,10 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
     rewards_saved = [initial_reward for _ in range(bootstrap_heads)]
 
-    fig, axes = plt.subplots(5, 1, figsize=(8, 8))
+    # ----- PLOTTING
+    fig, axes = plt.subplots(5, 1, figsize=(7, 8))
     rew_ax, loss_ax, kl_ax, ent_ax, ev_ax = axes
+    plt.tight_layout(pad=1.0, h_pad=1.5)
 
     x_start = 0
     x_end = 50
@@ -340,22 +344,37 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             ax.set_xlim(x_start, x_end)
     set_xbounds()
 
-    iter_x = []
-
     rew_ax.set_title('Average Reward')
     rew_ax.set_ylim(-2e3, 1e3)
-    rew_y = []
-    rew_points, = rew_ax.plot(iter_x, rew_y)
+    rew_y_by_head = []
+    rew_x_by_head = []
+    rew_points_by_head = []
+    for i in range(bootstrap_heads):
+        rew_y, rew_x = [], []
+        rew_y_by_head += [rew_y]
+        rew_x_by_head += [rew_x]
+        rew_points, = rew_ax.plot(rew_x, rew_y)
+        rew_points_by_head += [rew_points]
+
+    iter_x = []
 
     loss_ax.set_title('Loss (After Iteration)')
     loss_ax.set_ylim(-0.1, 0.1)
-    loss_y = []
-    loss_points, = loss_ax.plot(iter_x, loss_y)
+    loss_y_by_head, loss_points_by_head = [], []
+    for i in range(bootstrap_heads):
+        loss_y = []
+        loss_y_by_head += [loss_y]
+        loss_points, = loss_ax.plot(iter_x, loss_y)
+        loss_points_by_head += [loss_points]
 
     kl_ax.set_title('Max KL')
-    kl_ax.set_ylim(0, 2*desired_kl)
-    kl_y = []
-    kl_points, = kl_ax.plot(iter_x, kl_y)
+    kl_ax.set_ylim(0, 10*desired_kl)
+    kl_y_by_head, kl_points_by_head = [], []
+    for i in range(bootstrap_heads):
+        kl_y = []
+        kl_y_by_head += [kl_y]
+        kl_points, = kl_ax.plot(iter_x, kl_y)
+        kl_points_by_head += [kl_points]
 
     ent_ax.set_title('Average Entropy')
     ent_ax.set_ylim(0, 3)
@@ -369,11 +388,11 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
     ev_after_points, = ev_ax.plot(iter_x, ev_after_y)
 
     plt.ion()
-
-    # ob_memory = RollingMem(ROLL_MEM_SIZE)
+    # ----- PLOTTING
 
     for iter_i in range(n_iter):
         print("********** Iteration %i ************" % iter_i)
+        iter_x += [iter_i]
 
         # Randomly sample a bootstrap head
         # bootstrap_i = np.random.randint(bootstrap_heads)
@@ -381,6 +400,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         sy_sampled_ac = sy_sampled_acs[bootstrap_i]
         sy_mean = sy_means[bootstrap_i]
         sy_logstd = sy_logstds[bootstrap_i]
+        old_logstd = sy_logstd.eval()
 
         # Collect paths until we have enough timesteps
         timesteps_this_batch = 0
@@ -389,20 +409,15 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         while True:
             ob = env.reset().reshape((ob_dim,))
             terminated = False
-            logstd = None
             obs, acs, rewards, means = [], [], [], []
             animate_this_episode = (len(paths) == 0 and (i % 10 == 0) and animate)
             while True:
                 if animate_this_episode:
                     env.render()
 
-                # ob_memory.append(ob)
-                # std_ob = ob_memory.standardize(ob)
-                # obs.append(std_ob)
                 obs.append(ob)
-
-                mean, logstd, ac = sess.run([sy_mean, sy_logstd, sy_sampled_ac],
-                                            feed_dict={sy_ob: ob[None]})
+                mean, ac = sess.run([sy_mean, sy_sampled_ac],
+                                    feed_dict={sy_ob: ob[None]})
 
                 means.append(np.squeeze(mean, axis=0))
                 ac = np.squeeze(ac, axis=0)
@@ -419,7 +434,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
                     "reward": np.array(rewards),
                     "action": np.array(acs),
                     "dist_means": np.array(means),
-                    "dist_logstd": logstd,
                     "mask": (np.random.rand(bootstrap_heads) > 0.5) if bootstrap_heads > 1 else np.array([True])}
             paths.append(path)
             episodes_this_batch += 1
@@ -433,12 +447,11 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         max_kl = -np.inf
         avg_ent = 0
         for i in range(bootstrap_heads):
-            sy_mean = sy_means[i]
             sy_old_mean = sy_old_means[i]
-            sy_logstd = sy_logstds[i]
             sy_old_logstd = sy_old_logstds[i]
             sy_kl = sy_kls[i]
             sy_ent = sy_ents[i]
+            sy_policy_grad = sy_policy_grads[i]
             sy_flat_tan = sy_flat_tans[i]
             sy_fisher_vec_prod = sy_fisher_vec_prods[i]
             sy_surr = sy_surrs[i]
@@ -461,7 +474,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             ob = np.concatenate([path["observation"] for path in paths if path["mask"][i]])
             ac = np.concatenate([path["action"] for path in paths if path["mask"][i]])
             old_means = np.concatenate([path["dist_means"] for path in paths if path["mask"][i]])
-            old_logstd = paths[0]["dist_logstd"]  # TODO: ugly
             adv = np.concatenate(advs)
             standardized_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
@@ -491,13 +503,27 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
                 op_set_vars_from_flat.run(feed_dict={sy_theta: theta})
                 return sess.run(sy_surr, feed_dict=feed)
 
-            theta_new = linesearch(surr_loss, theta_old, fullstep, neggdotstepdir / lm)
+            theta_new, step_taken = linesearch(
+                surr_loss, theta_old, fullstep, neggdotstepdir / lm, i, i != bootstrap_i)
+            if i != bootstrap_i:
+                print(i,
+                      'fullstep norm', np.linalg.norm(fullstep),
+                      'step_taken norm', np.linalg.norm(step_taken))
             op_set_vars_from_flat.run(feed_dict={sy_theta: theta_new})
 
             surr_after, kl, ent = sess.run([sy_surr, sy_kl, sy_ent], feed_dict=feed)
 
-            if kl > 2 * desired_kl:  # TODO: ???
-                op_set_vars_from_flat.run(feed_dict={sy_theta: theta_old})
+            # ----- PLOTTING
+            loss_y = loss_y_by_head[i]
+            loss_y += [surr_after]
+            loss_points_by_head[i].set_data(iter_x, loss_y)
+            kl_y = kl_y_by_head[i]
+            kl_y += [kl]
+            kl_points_by_head[i].set_data(iter_x, kl_y)
+            # ----- PLOTTING
+
+            # if (i == bootstrap_i and kl > 2 * desired_kl) or kl > 10 * desired_kl:
+            #     op_set_vars_from_flat.run(feed_dict={sy_theta: theta_old})
 
             max_kl = max(max_kl, kl)
             avg_ent += ent
@@ -535,21 +561,14 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         # Note that we fit value function AFTER using it to compute the advantage function to avoid introducing bias
         logz.dump_tabular()
 
-        # plot in real time
-        iter_x += [iter_i]
-
+        # ------- PLOTTING
+        rew_x = rew_x_by_head[bootstrap_i]
+        rew_y = rew_y_by_head[bootstrap_i]
+        rew_x += [iter_i]
         rew_y += [ep_rew_mean]
-        rew_points.set_data(iter_x, rew_y)
-
-        loss_y += [surr_after]
-        loss_points.set_data(iter_x, loss_y)
-
-        kl_y += [max_kl]
-        kl_points.set_data(iter_x, kl_y)
-
+        rew_points_by_head[bootstrap_i].set_data(rew_x, rew_y)
         ent_y += [avg_ent]
         ent_points.set_data(iter_x, ent_y)
-
         ev_before_y += [ev_before]
         ev_after_y += [ev_after]
         ev_before_points.set_data(iter_x, ev_before_y)
@@ -561,6 +580,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             set_xbounds()
 
         plt.pause(0.05)
+        # ------- PLOTTING
 
 
 @click.command()
@@ -578,7 +598,7 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl):
         bootstrap_heads=bootstrap_heads,
         min_timesteps_per_batch=batch_timesteps,
         # min_timesteps_per_batch=25000,
-        n_iter=1500,
+        n_iter=(bootstrap_heads * 1500),
         initial_stepsize=1e-3,
         initial_reward=-650,
         seed=0,

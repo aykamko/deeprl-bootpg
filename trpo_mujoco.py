@@ -271,19 +271,23 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
             sy_mean = dense(sy_h2, ac_dim, 'mean%d' % i, weight_init=normc_initializer(0.1))  # Mean control output
             sy_logstd = tf.get_variable('logstd%d' % i, [ac_dim], initializer=tf.zeros_initializer())  # Variance
             sy_std = tf.exp(sy_logstd)
+            # sy_dist = tf.contrib.distributions.Normal(
+            #     name='dist%d' % i, loc=sy_mean, scale=sy_std, validate_args=True)
             sy_dist = tf.contrib.distributions.Normal(
-                name='dist%d' % i, loc=sy_mean, scale=sy_std, validate_args=True)
+                name='dist%d' % i, mu=sy_mean, sigma=sy_std, validate_args=True)
 
             sy_old_mean = tf.placeholder(shape=[None, ac_dim], name='oldmean', dtype=tf.float32)
             sy_old_logstd = tf.placeholder(shape=[ac_dim], name='oldlogstd', dtype=tf.float32)
             sy_old_std = tf.exp(sy_old_logstd)
+            # sy_old_dist = tf.contrib.distributions.Normal(
+            #     name='olddist%d' % i, loc=sy_old_mean, scale=sy_old_std, validate_args=True)
             sy_old_dist = tf.contrib.distributions.Normal(
-                name='olddist%d' % i, loc=sy_old_mean, scale=sy_old_std, validate_args=True)
+                name='olddist%d' % i, mu=sy_old_mean, sigma=sy_old_std, validate_args=True)
 
             sy_sampled_ac = sy_dist.sample()
 
-            sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
-            sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
+            sy_ac_prob = tf.reduce_prod(tf.squeeze(sy_dist.prob(sy_ac)),axis=1)
+            sy_old_ac_prob = tf.reduce_prod(tf.squeeze(sy_old_dist.prob(sy_ac)),axis=1)
             sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
 
             # sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
@@ -298,8 +302,10 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
             sy_policy_grad = flatgrad(sy_surr, var_list)
 
+            # sy_fixed_dist = tf.contrib.distributions.Normal(
+            #     loc=tf.stop_gradient(sy_mean), scale=tf.stop_gradient(sy_std))
             sy_fixed_dist = tf.contrib.distributions.Normal(
-                loc=tf.stop_gradient(sy_mean), scale=tf.stop_gradient(sy_std))
+                mu=tf.stop_gradient(sy_mean), sigma=tf.stop_gradient(sy_std))
             sy_kl_firstfixed = tf.reduce_mean(tf.contrib.distributions.kl(sy_fixed_dist, sy_dist))
             sy_grads = tf.gradients(sy_kl_firstfixed, var_list)
 
@@ -520,6 +526,8 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
             theta_old = op_get_vars_flat.eval()
             policy_grad = sy_policy_grad.eval(feed_dict=feed)
+
+
             stepdir = conjugate_gradient(fisher_vector_product, -policy_grad)
 
             fvp = fisher_vector_product(stepdir)
@@ -602,10 +610,10 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 
 
 @click.command()
-@click.option('--env', default='Pendulum-v0')
+@click.option('--env', default='HalfCheetah-v1')
 @click.option('--gamma', '-g', default=0.99)
 @click.option('--bootstrap-heads', '-k', default=1)
-@click.option('--batch-timesteps', '-t', default=2500)
+@click.option('--batch-timesteps', '-t', default=10000)
 @click.option('--desired-kl', default=2e-3)
 @click.option('--n-iter', default=400)
 def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter):

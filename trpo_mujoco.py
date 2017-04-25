@@ -3,6 +3,7 @@
 Reference implementation: https://github.com/wojzaremba/trpo
 """
 
+import threading
 import numpy as np
 import tensorflow as tf
 import gym
@@ -12,6 +13,7 @@ from os import path as osp
 import os
 import click
 import matplotlib.pyplot as plt
+import mpld3_custom.mpld3 as mpld3
 import seaborn as sns
 import atexit
 import pickle
@@ -21,6 +23,9 @@ MACHINE_EPS = np.finfo(np.float32).eps
 CG_DAMP = 0.1
 ROLL_MEM_SIZE = 1000
 CLEAR_LOGS = True
+
+REFRESH_RATE = 3
+SERVER_STARTED = False
 
 
 class RollingMem:
@@ -229,12 +234,13 @@ class NnValueFunction:
 def dump_stats(logdir, stats):
     os.makedirs(logdir, exist_ok=True)
     statfile_path = osp.join(logdir, '{}_stats.pkl'.format(str(os.getpid())))
-    with open(statfile_path, 'w') as f:
+    with open(statfile_path, 'wb') as f:
         pickle.dump(stats, f)
 
 
 def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,
-          initial_stepsize, initial_reward, desired_kl, vf_type, vf_params, animate=False):
+          initial_stepsize, initial_reward, desired_kl, vf_type, vf_params, animate=False,
+          use_mpld3=False):
 
     tf.set_random_seed(seed)
     np.random.seed(seed)
@@ -363,6 +369,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     rewards_saved = [initial_reward for _ in range(bootstrap_heads)]
 
     # ----- PLOTTING
+    dynamic_html = mpld3.DynamicHTML(None)
     fig, axes = plt.subplots(4, 1, figsize=(7, 8))
     rew_ax, loss_ax, kl_ax, ev_ax = axes
     plt.tight_layout(pad=2.0, h_pad=1.5)
@@ -617,7 +624,16 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             x_end += 1
             set_xbounds()
 
-        plt.pause(0.05)
+        if not use_mpld3:
+            plt.pause(0.05)
+        else:
+            dynamic_html.content = mpld3.fig_to_html(fig)
+            global SERVER_STARTED
+            if not SERVER_STARTED:
+                def d3show():
+                    mpld3.show(dynamic=dynamic_html, refresh_rate=REFRESH_RATE)
+                threading.Thread(target=d3show, args=()).start()
+                SERVER_STARTED = True
         # ------- PLOTTING
 
 
@@ -628,10 +644,11 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
 @click.option('--batch-timesteps', '-t', default=10000)
 @click.option('--desired-kl', default=2e-3)
 @click.option('--n-iter', default=400)
-def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter):
+@click.option('--use-mpld3', is_flag=True)
+def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, use_mpld3):
     _main(
         gym_env=env,
-        logdir=osp.join(osp.abspath(__file__), '/log'),
+        logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
         animate=False,
         gamma=gamma,
         bootstrap_heads=bootstrap_heads,
@@ -643,7 +660,8 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter):
         seed=0,
         desired_kl=desired_kl,
         vf_type='nn',
-        vf_params={}
+        vf_params={},
+        use_mpld3=use_mpld3,
     )
 
 

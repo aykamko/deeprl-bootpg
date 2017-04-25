@@ -9,14 +9,18 @@ import gym
 import logz
 import scipy.signal
 from os import path as osp
+import os
 import click
 import matplotlib.pyplot as plt
 import seaborn as sns
+import atexit
+import pickle
 
 
 MACHINE_EPS = np.finfo(np.float32).eps
 CG_DAMP = 0.1
 ROLL_MEM_SIZE = 1000
+CLEAR_LOGS = True
 
 
 class RollingMem:
@@ -222,8 +226,16 @@ class NnValueFunction:
         }))
 
 
-def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,
-             initial_stepsize, initial_reward, desired_kl, vf_type, vf_params, animate=False):
+def dump_stats(logdir, stats):
+    os.makedirs(logdir, exist_ok=True)
+    statfile_path = osp.join(logdir, '{}_stats.pkl'.format(str(os.getpid())))
+    with open(statfile_path, 'w') as f:
+        pickle.dump(stats, f)
+
+
+def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,
+          initial_stepsize, initial_reward, desired_kl, vf_type, vf_params, animate=False):
+
     tf.set_random_seed(seed)
     np.random.seed(seed)
     env = gym.make(gym_env)
@@ -395,11 +407,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         kl_points, = kl_ax.plot(iter_x, kl_y)
         kl_points_by_head += [kl_points]
 
-    # ent_ax.set_title('Average Entropy')
-    # ent_ax.set_ylim(0, 3)
-    # ent_y = []
-    # ent_points, = ent_ax.plot(iter_x, ent_y)
-
     ev_ax.set_title('Explained Variance (After update, by head)')
     ev_ax.set_ylim(-1, 1)
     ev_y_by_head, ev_points_by_head = [], []
@@ -408,6 +415,13 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         ev_y_by_head += [ev_y]
         ev_points, = ev_ax.plot(iter_x, ev_y)
         ev_points_by_head += [ev_points]
+
+    atexit.register(dump_stats, logdir, {
+        'rew_by_head': (rew_x_by_head, rew_y_by_head),
+        'loss_by_head': (iter_x, loss_y_by_head),
+        'kl_by_head': (iter_x, kl_y_by_head),
+        'ev_by_head': (iter_x, ev_y_by_head),
+    })
 
     plt.ion()
     # ----- PLOTTING
@@ -578,7 +592,7 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         ep_rew_mean = np.mean([path["reward"].sum() for path in paths])
         logz.log_tabular("EpRewMean", ep_rew_mean)
         logz.log_tabular("EpLenMean", np.mean([pathlength(path) for path in paths]))
-        logz.log_tabular("MaxKLOldNew", max_kl)
+        logz.log_tabular("KLOldNew", max_kl)
         logz.log_tabular("AvgEntropy", avg_ent)
         # logz.log_tabular("EVBefore", ev_before)
         # logz.log_tabular("EVAfter", ev_after)
@@ -597,8 +611,6 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
         rew_x += [iter_i]
         rew_y += [ep_rew_mean]
         rew_points_by_head[bootstrap_i].set_data(rew_x, rew_y)
-        # ent_y += [avg_ent]
-        # ent_points.set_data(iter_x, ent_y)
 
         if iter_i > 45:
             x_start += 1
@@ -617,14 +629,14 @@ def pendulum(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timestep
 @click.option('--desired-kl', default=2e-3)
 @click.option('--n-iter', default=400)
 def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter):
-    pendulum(
+    _main(
         gym_env=env,
         logdir=osp.join(osp.abspath(__file__), '/log'),
         animate=False,
         gamma=gamma,
         bootstrap_heads=bootstrap_heads,
-        min_timesteps_per_batch=(bootstrap_heads * batch_timesteps),
-        # min_timesteps_per_batch=25000,
+        # min_timesteps_per_batch=(bootstrap_heads * batch_timesteps),
+        min_timesteps_per_batch=batch_timesteps,
         n_iter=400,
         initial_stepsize=1e-3,
         initial_reward=-650,

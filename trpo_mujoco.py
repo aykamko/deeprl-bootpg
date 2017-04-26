@@ -9,14 +9,25 @@ import tensorflow as tf
 import gym
 import logz
 import scipy.signal
-from os import path as osp
 import os
 import click
+import logging
+if os.getenv('SSH_CLIENT'):
+    # Servers don't always have X running
+    import matplotlib as mpl
+    mpl.use('Agg')
 import matplotlib.pyplot as plt
+import sys
 import mpld3_custom.mpld3 as mpld3
 import seaborn as sns
 import atexit
 import pickle
+
+from os import path as osp
+from tqdm import tqdm
+
+logger = logging.getLogger('trpo')
+logger.setLevel(logging.DEBUG)
 
 
 MACHINE_EPS = np.finfo(np.float32).eps
@@ -199,7 +210,8 @@ class LinearValueFunction:
 
 
 class NnValueFunction:
-    def __init__(self, ob_dim, n_epochs=30, stepsize=1e-3):
+    #def __init__(self, ob_dim, n_epochs=10, stepsize=1e-3):
+    def __init__(self, ob_dim, n_epochs=5, stepsize=1e-3):
         self.ob_dim = ob_dim
         self.n_epochs = n_epochs
         self.stepsize = stepsize
@@ -219,7 +231,9 @@ class NnValueFunction:
         self.update_op = tf.train.AdamOptimizer(self.stepsize).minimize(loss)
 
     def fit(self, X, y):
-        for _ in range(self.n_epochs):
+        logger.info('Fitting NNValueFunction')
+        for i in range(self.n_epochs):
+            logger.debug('iter %d/%d', i, self.n_epochs)
             self.update_op.run(feed_dict={
                 self.sy_ob: X,
                 self.sy_targ_v: y,
@@ -438,8 +452,10 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         iter_x += [iter_i]
 
         # Randomly sample a bootstrap head
-        # bootstrap_i = np.random.randint(bootstrap_heads)
-        bootstrap_i = sample_bootstrap_heads(rewards_saved)
+        bootstrap_i = np.random.randint(bootstrap_heads)
+        # bootstrap_i = sample_bootstrap_heads(rewards_saved)
+        logger.info('Sampled head %d', bootstrap_i)
+
         sy_sampled_ac = sy_sampled_acs[bootstrap_i]
         sy_mean = sy_means[bootstrap_i]
         sy_logstd = sy_logstds[bootstrap_i]
@@ -450,40 +466,41 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         timesteps_this_batch = 0
         episodes_this_batch = 0
         paths = []
-        while True:
-            ob = env.reset().reshape((ob_dim,))
-            terminated = False
-            obs, acs, rewards, means = [], [], [], []
-            animate_this_episode = (len(paths) == 0 and (i % 10 == 0) and animate)
-            while True:
-                if animate_this_episode:
-                    env.render()
+        with tqdm(total=min_timesteps_per_batch) as pbar:
+                while True:
+                    ob = env.reset().reshape((ob_dim,)); pbar.update(1)
+                    terminated = False
+                    obs, acs, rewards, means = [], [], [], []
+                    animate_this_episode = (len(paths) == 0 and (i % 10 == 0) and animate)
+                    while True:
+                        if animate_this_episode:
+                            env.render()
 
-                obs.append(ob)
-                mean, ac = sess.run([sy_mean, sy_sampled_ac],
-                                    feed_dict={sy_ob: ob[None]})
+                        obs.append(ob)
+                        mean, ac = sess.run([sy_mean, sy_sampled_ac],
+                                            feed_dict={sy_ob: ob[None]})
 
-                means.append(np.squeeze(mean, axis=0))
-                ac = np.squeeze(ac, axis=0)
-                acs.append(ac)
-                ob, rew, done, _ = env.step(ac)
-                ob = np.squeeze(ob)
+                        means.append(np.squeeze(mean, axis=0))
+                        ac = np.squeeze(ac, axis=0)
+                        acs.append(ac)
+                        ob, rew, done, _ = env.step(ac); pbar.update(1)
+                        ob = np.squeeze(ob)
 
-                rewards.append(rew)
-                if done:
-                    break
+                        rewards.append(rew)
+                        if done:
+                            break
 
-            path = {"observation": np.array(obs),
-                    "terminated": terminated,
-                    "reward": np.array(rewards),
-                    "action": np.array(acs),
-                    "dist_means": np.array(means),
-                    "mask": (np.random.rand(bootstrap_heads) > 0.5) if bootstrap_heads > 1 else np.array([True])}
-            paths.append(path)
-            episodes_this_batch += 1
-            timesteps_this_batch += pathlength(path)
-            if timesteps_this_batch > min_timesteps_per_batch:
-                break
+                    path = {"observation": np.array(obs),
+                            "terminated": terminated,
+                            "reward": np.array(rewards),
+                            "action": np.array(acs),
+                            "dist_means": np.array(means),
+                            "mask": (np.random.rand(bootstrap_heads) > 0.5) if bootstrap_heads > 1 else np.array([True])}
+                    paths.append(path)
+                    episodes_this_batch += 1
+                    timesteps_this_batch += pathlength(path)
+                    if timesteps_this_batch > min_timesteps_per_batch:
+                        break
 
         total_episodes += episodes_this_batch
         total_timesteps += timesteps_this_batch

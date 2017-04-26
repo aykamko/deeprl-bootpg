@@ -6,6 +6,7 @@ Reference implementation: https://github.com/wojzaremba/trpo
 import threading
 import numpy as np
 import tensorflow as tf
+from tensorflow.python import debug as tf_debug
 import gym
 import logz
 import scipy.signal
@@ -13,9 +14,9 @@ import os
 import click
 import logging
 if os.getenv('SSH_CLIENT'):
-    # Servers don't always have X running
-    import matplotlib as mpl
-    mpl.use('Agg')
+    # Servers don't always have X installed/running
+    import matplotlib
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import sys
 import mpld3_custom.mpld3 as mpld3
@@ -210,8 +211,7 @@ class LinearValueFunction:
 
 
 class NnValueFunction:
-    #def __init__(self, ob_dim, n_epochs=10, stepsize=1e-3):
-    def __init__(self, ob_dim, n_epochs=5, stepsize=1e-3):
+    def __init__(self, ob_dim, n_epochs=20, stepsize=1e-3):
         self.ob_dim = ob_dim
         self.n_epochs = n_epochs
         self.stepsize = stepsize
@@ -232,8 +232,7 @@ class NnValueFunction:
 
     def fit(self, X, y):
         logger.info('Fitting NNValueFunction')
-        for i in range(self.n_epochs):
-            logger.debug('iter %d/%d', i, self.n_epochs)
+        for _ in tqdm(range(self.n_epochs)):
             self.update_op.run(feed_dict={
                 self.sy_ob: X,
                 self.sy_targ_v: y,
@@ -254,7 +253,7 @@ def dump_stats(logdir, stats):
 
 def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,
           initial_stepsize, initial_reward, desired_kl, vf_type, vf_params, animate=False,
-          use_mpld3=False):
+          mpld3_port=-1):
 
     tf.set_random_seed(seed)
     np.random.seed(seed)
@@ -306,7 +305,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             # sy_dist = tf.contrib.distributions.Normal(
             #     name='dist%d' % i, loc=sy_mean, scale=sy_std, validate_args=True)
             sy_dist = tf.contrib.distributions.Normal(
-                name='dist%d' % i, mu=sy_mean, sigma=sy_std, validate_args=True)
+                name='dist%d' % i, loc=sy_mean, scale=sy_std, validate_args=True)
 
             sy_old_mean = tf.placeholder(shape=[None, ac_dim], name='oldmean', dtype=tf.float32)
             sy_old_logstd = tf.placeholder(shape=[ac_dim], name='oldlogstd', dtype=tf.float32)
@@ -314,13 +313,14 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             # sy_old_dist = tf.contrib.distributions.Normal(
             #     name='olddist%d' % i, loc=sy_old_mean, scale=sy_old_std, validate_args=True)
             sy_old_dist = tf.contrib.distributions.Normal(
-                name='olddist%d' % i, mu=sy_old_mean, sigma=sy_old_std, validate_args=True)
+                name='olddist%d' % i, loc=sy_old_mean, scale=sy_old_std, validate_args=True)
 
             sy_sampled_ac = sy_dist.sample()
 
-            sy_ac_prob = tf.reduce_prod(tf.squeeze(sy_dist.prob(sy_ac)),axis=1)
-            sy_old_ac_prob = tf.reduce_prod(tf.squeeze(sy_old_dist.prob(sy_ac)),axis=1)
-            sy_surr = -tf.reduce_mean((sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)) * sy_adv)
+            sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
+            sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
+            sy_ac_prob_ratio = tf.reduce_prod(sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS), axis=1)
+            sy_surr = -tf.reduce_mean(sy_ac_prob_ratio * sy_adv)
 
             # sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
             # sy_ac_safe_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)
@@ -337,7 +337,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             # sy_fixed_dist = tf.contrib.distributions.Normal(
             #     loc=tf.stop_gradient(sy_mean), scale=tf.stop_gradient(sy_std))
             sy_fixed_dist = tf.contrib.distributions.Normal(
-                mu=tf.stop_gradient(sy_mean), sigma=tf.stop_gradient(sy_std))
+                loc=tf.stop_gradient(sy_mean), scale=tf.stop_gradient(sy_std))
             sy_kl_firstfixed = tf.reduce_mean(tf.contrib.distributions.kl(sy_fixed_dist, sy_dist))
             sy_grads = tf.gradients(sy_kl_firstfixed, var_list)
 
@@ -374,6 +374,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         sy_thetas += [sy_theta]
 
     sess = tf.Session()
+    #sess = tf_debug.LocalCLIDebugWrapperSession(sess)
     sess.__enter__()  # equivalent to `with sess:`
     tf.global_variables_initializer().run()  # pylint: disable=E1101
 
@@ -397,7 +398,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     set_xbounds()
 
     rew_ax.set_title('Average Reward (Rollout Head)')
-    rew_ax.set_ylim(-1.5e3, 0)
     rew_y_by_head = []
     rew_x_by_head = []
     rew_points_by_head = []
@@ -411,7 +411,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     iter_x = []
 
     loss_ax.set_title('Loss (After train iteration, by head)')
-    loss_ax.set_ylim(-0.04, 0.04)
     loss_y_by_head, loss_points_by_head = [], []
     for i in range(bootstrap_heads):
         loss_y = []
@@ -596,12 +595,18 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             # ----- PLOTTING
             loss_y = loss_y_by_head[i]
             loss_y += [surr_after]
+            loss_points_by_head[i]._y = loss_y  # XXX: bug in matplotlib
             loss_points_by_head[i].set_data(iter_x, loss_y)
+            # recompute loss axis
+            loss_ax.relim()
+            loss_ax.autoscale()
             kl_y = kl_y_by_head[i]
             kl_y += [kl]
+            kl_points_by_head[i]._y = kl_y  # XXX: bug in matplotlib
             kl_points_by_head[i].set_data(iter_x, kl_y)
             ev_y = ev_y_by_head[i]
             ev_y += [ev_after]
+            ev_points_by_head[i]._y = ev_y  # XXX: bug in matplotlib
             ev_points_by_head[i].set_data(iter_x, ev_y)
             # ----- PLOTTING
 
@@ -634,35 +639,40 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         rew_y = rew_y_by_head[bootstrap_i]
         rew_x += [iter_i]
         rew_y += [ep_rew_mean]
+        rew_points_by_head[bootstrap_i]._y = rew_y  # XXX: bug in matplotlib
         rew_points_by_head[bootstrap_i].set_data(rew_x, rew_y)
+        # recompute loss axis
+        rew_ax.relim()
+        rew_ax.autoscale()
 
         if iter_i > 45:
             x_start += 1
             x_end += 1
-            set_xbounds()
+        set_xbounds()
 
-        if not use_mpld3:
+        if mpld3_port < 0:
             plt.pause(0.05)
         else:
             dynamic_html.content = mpld3.fig_to_html(fig)
             global SERVER_STARTED
             if not SERVER_STARTED:
                 def d3show():
-                    mpld3.show(dynamic=dynamic_html, refresh_rate=REFRESH_RATE)
+                    mpld3.show(dynamic=dynamic_html, refresh_rate=REFRESH_RATE, ip='0.0.0.0', port=mpld3_port)
                 threading.Thread(target=d3show, args=()).start()
                 SERVER_STARTED = True
         # ------- PLOTTING
 
 
 @click.command()
-@click.option('--env', default='HalfCheetah-v1')
-@click.option('--gamma', '-g', default=0.99)
+@click.option('--env', default='Pendulum-v0')
+@click.option('--gamma', '-g', default=0.97)
 @click.option('--bootstrap-heads', '-k', default=1)
 @click.option('--batch-timesteps', '-t', default=10000)
 @click.option('--desired-kl', default=2e-3)
 @click.option('--n-iter', default=400)
-@click.option('--use-mpld3', is_flag=True)
-def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, use_mpld3):
+@click.option('--mpld3-port', default=-1)
+@click.option('--vf-epochs', default=10)
+def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3_port, vf_epochs):
     _main(
         gym_env=env,
         logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
@@ -671,14 +681,14 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, use_m
         bootstrap_heads=bootstrap_heads,
         # min_timesteps_per_batch=(bootstrap_heads * batch_timesteps),
         min_timesteps_per_batch=batch_timesteps,
-        n_iter=400,
+        n_iter=n_iter,
         initial_stepsize=1e-3,
         initial_reward=-650,
         seed=0,
         desired_kl=desired_kl,
         vf_type='nn',
-        vf_params={},
-        use_mpld3=use_mpld3,
+        vf_params={'n_epochs': vf_epochs},
+        mpld3_port=mpld3_port,
     )
 
 

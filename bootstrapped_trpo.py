@@ -18,6 +18,7 @@ import threading
 import multiprocessing
 from os import path as osp
 from tqdm import tqdm
+from numpy_ringbuffer import RingBuffer
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt  # noqa
@@ -32,6 +33,7 @@ MACHINE_EPS = np.finfo(np.float32).eps
 CG_DAMP = 0.1
 ROLL_MEM_SIZE = 1000
 CLEAR_LOGS = True
+EP_AVG_LEN = 5
 
 REFRESH_RATE = -1
 SERVER_STARTED = False
@@ -183,6 +185,11 @@ def conjugate_gradient(f_Ax, b, cg_iters=10, residual_tol=1e-10):
     return x
 
 
+def softmax(x):
+    exp_x = np.exp(x - np.max(x))
+    return exp_x / np.sum(exp_x)
+
+
 class LinearValueFunction:
     coef = None
 
@@ -249,7 +256,7 @@ def dump_stats(logdir, stats):
 
 def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,  # noqa
           initial_stepsize, desired_kl, vf_type, vf_params, animate=False,
-          mpld3_start_port=-1):
+          mpld3_start_port=-1, softmax_temp=250):
 
     tf.set_random_seed(seed)
     np.random.seed(seed)
@@ -447,12 +454,28 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         'ev_y_by_head': ev_y_by_head,
     })
 
+    ep_avg_history = np.empty(bootstrap_heads, dtype=np.object)
+    for i in range(bootstrap_heads):
+        ep_avg_history[i] = RingBuffer(capacity=EP_AVG_LEN, dtype=np.int)
+    past_ep_avg = np.empty(bootstrap_heads)
+    past_ep_avg.fill(np.nan)
+
     for iter_i in range(n_iter):
         print("********** Iteration %i ************" % iter_i)
         iter_x += [iter_i]
 
         # Randomly sample a bootstrap head
-        bootstrap_i = np.random.randint(bootstrap_heads)
+        for k in range(bootstrap_heads):
+            past_ep_avg[k] = np.mean(np.array(ep_avg_history[k]))
+
+        if any(np.isnan(past_ep_avg)):
+            bootstrap_i = np.random.randint(bootstrap_heads)
+        else:
+            print('past_ep_avg:', past_ep_avg)
+            past_ep_avg_softmax = softmax(past_ep_avg / softmax_temp)
+            print('softmax:', past_ep_avg_softmax)
+            bootstrap_i = np.random.choice(bootstrap_heads, p=past_ep_avg_softmax)
+
         # bootstrap_i = sample_bootstrap_heads(rewards_saved)
         logger.info('Sampled head %d', bootstrap_i)
 
@@ -617,6 +640,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         # Log diagnostics
         logz.log_tabular("Head", bootstrap_i)
         ep_rew_mean = np.mean([path["reward"].sum() for path in paths])
+        ep_avg_history[bootstrap_i].append(ep_rew_mean)
         logz.log_tabular("EpRewMean", ep_rew_mean)
         logz.log_tabular("EpLenMean", np.mean([pathlength(path) for path in paths]))
         logz.log_tabular("KLOldNew", max_kl)
@@ -674,8 +698,10 @@ def _main1(d):
 @click.option('--desired-kl', default=2e-3)
 @click.option('--n-iter', default=400)
 @click.option('--mpld3-start-port', default=-1)
-@click.option('--vf-epochs', default=10)
-def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3_start_port, vf_epochs):
+@click.option('--vf-epochs', default=25)
+@click.option('--softmax-temp', default=250)
+def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3_start_port,
+         vf_epochs, softmax_temp):
     bootstrap_heads = [int(k) for k in bootstrap_heads.split(',')]
 
     general_params = dict(
@@ -691,6 +717,7 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3
         initial_stepsize=1e-3,
         desired_kl=desired_kl,
         mpld3_start_port=mpld3_start_port,
+        softmax_temp=softmax_temp,
     )
 
     params = [dict(bootstrap_heads=k, **general_params) for k in bootstrap_heads]

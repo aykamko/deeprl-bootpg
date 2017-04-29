@@ -248,9 +248,9 @@ class NnValueFunction:
         }))
 
 
-def dump_stats(logdir, stats):
+def dump_stats(logdir, k, stats):
     os.makedirs(logdir, exist_ok=True)
-    statfile_path = osp.join(logdir, '{}_stats.pkl'.format(str(os.getpid())))
+    statfile_path = osp.join(logdir, 'k{}_{}_stats.pkl'.format(k, str(os.getpid())))
     with open(statfile_path, 'wb') as f:
         pickle.dump(stats, f)
 
@@ -305,8 +305,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             sy_mean = dense(sy_h2, ac_dim, 'mean%d' % i, weight_init=normc_initializer(0.1))  # Mean control output
             sy_logstd = tf.get_variable('logstd%d' % i, [ac_dim], initializer=tf.zeros_initializer())  # Variance
             sy_std = tf.exp(sy_logstd)
-            # sy_dist = tf.contrib.distributions.Normal(
-            #     name='dist%d' % i, loc=sy_mean, scale=sy_std, validate_args=True)
             sy_dist = tf.contrib.distributions.Normal(
                 name='dist%d' % i, loc=sy_mean, scale=sy_std, validate_args=True)
 
@@ -444,7 +442,8 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
 
     args, _, _, values = inspect.getargvalues(inspect.currentframe())
     program_args = {arg: values[arg] for arg in args}
-    atexit.register(dump_stats, logdir, {
+
+    atexit.register(dump_stats, logdir, bootstrap_heads, {
         'program_args': program_args,
         'rew_x_by_head': rew_x_by_head,
         'rew_y_by_head': rew_y_by_head,
@@ -687,7 +686,10 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
 
 
 def _main1(d):
-    return _main(**d)
+    try:
+        _main(**d)
+    finally:
+        atexit._run_exitfuncs()
 
 
 @click.command()

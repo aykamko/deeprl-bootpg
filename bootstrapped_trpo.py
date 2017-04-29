@@ -3,20 +3,21 @@
 Reference implementation: https://github.com/wojzaremba/trpo
 """
 
-import threading
-import numpy as np
-import tensorflow as tf
-import gym
-import logz
-import scipy.signal
-import os
+import atexit
 import click
+import gym
+import inspect
 import logging
+import logz
 import matplotlib.pyplot as plt
 import mpld3_custom.mpld3 as mpld3
-import seaborn as sns  # noqa
-import atexit
+import numpy as np
+import os
 import pickle
+import scipy.signal
+import seaborn as sns  # noqa
+import tensorflow as tf
+import threading
 from os import path as osp
 from tqdm import tqdm
 
@@ -317,7 +318,9 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
 
             sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
             sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
-            sy_ac_prob_ratio = tf.reduce_prod(sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS), axis=1)
+            sy_ac_prob_ratio = sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)
+            if ac_dim > 1:
+                sy_ac_prob_ratio = np.reduce_prod(sy_ac_prob_ratio, axis=1)
             sy_surr = -tf.reduce_mean(sy_ac_prob_ratio * sy_adv)
 
             # sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
@@ -434,15 +437,19 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         ev_points, = ev_ax.plot(iter_x, ev_y)
         ev_points_by_head += [ev_points]
 
-    atexit.register(dump_stats, logdir, {
-        'rew_by_head': (rew_x_by_head, rew_y_by_head),
-        'loss_by_head': (iter_x, loss_y_by_head),
-        'kl_by_head': (iter_x, kl_y_by_head),
-        'ev_by_head': (iter_x, ev_y_by_head),
-    })
-
     plt.ion()
     # ----- PLOTTING
+
+    args, _, _, values = inspect.getargvalues(inspect.currentframe())
+    atexit.register(dump_stats, logdir, {
+        'program_args': dict(zip(args, values)),
+        'rew_x_by_head': rew_x_by_head,
+        'rew_y_by_head': rew_y_by_head,
+        'iter_x': iter_x,
+        'loss_y_by_head': loss_y_by_head,
+        'kl_y_by_head': kl_y_by_head,
+        'ev_y_by_head': ev_y_by_head,
+    })
 
     for iter_i in range(n_iter):
         print("********** Iteration %i ************" % iter_i)

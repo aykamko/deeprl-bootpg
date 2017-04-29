@@ -34,7 +34,9 @@ CLEAR_LOGS = True
 EP_AVG_LEN = 5
 
 REFRESH_RATE = -1
-SERVER_STARTED = False
+PROC_SERVER_THREAD = None
+
+BERNOULLI_P = 1.0
 
 
 class RollingMem:
@@ -272,14 +274,10 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     print("ob_dim is:", ob_dim)
     print("ac_dim is:", ac_dim)
 
-    vfs = []
-    for i in range(bootstrap_heads):
-        with tf.variable_scope('value_head%d' % i):
-            vf = {
-                'linear': LinearValueFunction,
-                'nn': NnValueFunction,
-            }[vf_type](ob_dim, logfile=logfile, bootstrap_i=i, **vf_params)
-            vfs += [vf]
+    vf = {
+        'linear': LinearValueFunction,
+        'nn': NnValueFunction,
+    }[vf_type](ob_dim, logfile=logfile, bootstrap_i=0, **vf_params)
 
     with tf.variable_scope('shared'):
         sy_ob = tf.placeholder(shape=[None, ob_dim], name='ob', dtype=tf.float32)  # batch of observations
@@ -434,14 +432,12 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         kl_points, = kl_ax.plot(iter_x, kl_y)
         kl_points_by_head += [kl_points]
 
-    ev_ax.set_title('Explained Variance (After update, by head)')
+    ev_ax.set_title('Explained Variance (Shared Value Function, Before vs. After Update)')
     ev_ax.set_ylim(-1, 1)
-    ev_y_by_head, ev_points_by_head = [], []
-    for i in range(bootstrap_heads):
-        ev_y = []
-        ev_y_by_head += [ev_y]
-        ev_points, = ev_ax.plot(iter_x, ev_y)
-        ev_points_by_head += [ev_points]
+    ev_before_y = []
+    ev_before_points, = ev_ax.plot(iter_x, ev_before_y)
+    ev_after_y = []
+    ev_after_points, = ev_ax.plot(iter_x, ev_after_y)
 
     plt.ion()
     # ----- PLOTTING
@@ -459,27 +455,10 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         'ev_y_by_head': ev_y_by_head,
     })
 
-    ep_avg_history = np.empty(bootstrap_heads, dtype=np.object)
-    for i in range(bootstrap_heads):
-        ep_avg_history[i] = RingBuffer(capacity=EP_AVG_LEN, dtype=np.int)
-    past_ep_avg = np.empty(bootstrap_heads)
-    past_ep_avg.fill(np.nan)
-
     for iter_i in range(n_iter):
         print("********** Iteration %i ************" % iter_i)
         iter_x += [iter_i]
 
-        # Randomly sample a bootstrap head
-        for k in range(bootstrap_heads):
-            past_ep_avg[k] = np.mean(np.array(ep_avg_history[k]))
-
-        # if any(np.isnan(past_ep_avg)):
-        #     bootstrap_i = np.random.randint(bootstrap_heads)
-        # else:
-        #     print('past_ep_avg:', past_ep_avg)
-        #     past_ep_avg_softmax = softmax(past_ep_avg / softmax_temp)
-        #     print('softmax:', past_ep_avg_softmax)
-        #     bootstrap_i = np.random.choice(bootstrap_heads, p=past_ep_avg_softmax)
         bootstrap_i = np.random.randint(bootstrap_heads)
 
         # bootstrap_i = sample_bootstrap_heads(rewards_saved)
@@ -488,7 +467,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         sy_sampled_ac = sy_sampled_acs[bootstrap_i]
         sy_mean = sy_means[bootstrap_i]
         sy_logstd = sy_logstds[bootstrap_i]
-        rollout_vf = vfs[bootstrap_i]
 
         # Collect paths until we have enough timesteps
         old_logstd = sy_logstd.eval()
@@ -519,12 +497,16 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
                     if done:
                         break
 
+		if bootstrap_heads > 1:
+                    mask = np.random.rand(bootstrap_heads) < BERNOULLI_P
+                else:
+                    mask = np.array([True])
                 path = {"observation": np.array(obs),
                         "terminated": terminated,
                         "reward": np.array(rewards),
                         "action": np.array(acs),
                         "dist_means": np.array(means),
-                        "mask": (np.random.rand(bootstrap_heads) > 0.5) if bootstrap_heads > 1 else np.array([True])}
+                        "mask": mask}
                 paths.append(path)
                 episodes_this_batch += 1
                 timesteps_this_batch += pathlength(path)
@@ -533,6 +515,23 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
 
         total_episodes += episodes_this_batch
         total_timesteps += timesteps_this_batch
+
+        # Estimate advantage function
+        vtargs, baselines, advs = [], [], []
+        for path in paths:
+            vtargs.append(discount(path["reward"], gamma))
+            rew_t = path["reward"]
+            return_t = discount(rew_t, gamma)
+            baseline_t = vf.predict(path["observation"])
+            baselines.append(baseline_t)
+            adv_t = return_t - baseline_t
+            advs.append(adv_t)
+
+        # Fit value function
+        vtarg = np.concatenate(vtargs)
+        ev_before = explained_variance_1d(np.concatenate(baselines), vtarg)
+        vf.fit(ob, vtarg)  # fit!
+        ev_after = explained_variance_1d(np.squeeze(vf.predict(ob)), vtarg)
 
         max_kl = -np.inf
         avg_ent = 0
@@ -548,33 +547,13 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             op_get_vars_flat = ops_get_vars_flat[i]
             op_set_vars_from_flat = ops_set_vars_from_flat[i]
             sy_theta = sy_thetas[i]
-            vf = vfs[i]
-
-            # Estimate advantage function
-            vtargs, baselines, advs = [], [], []
-            for path in paths:
-                if not path["mask"][i]:
-                    continue
-                vtargs.append(discount(path["reward"], gamma))
-                rew_t = path["reward"]
-                return_t = discount(rew_t, gamma)
-                # TODO: use rollout vf or this head's vf? former seems to do a bit better?
-                baseline_t = rollout_vf.predict(path["observation"])
-                baselines.append(baseline_t)
-                adv_t = return_t - baseline_t
-                advs.append(adv_t)
 
             # Build arrays for policy update
             ob = np.concatenate([path["observation"] for path in paths if path["mask"][i]])
             ac = np.concatenate([path["action"] for path in paths if path["mask"][i]])
             old_means = np.concatenate([path["dist_means"] for path in paths if path["mask"][i]])
-            adv = np.concatenate(advs)
+            adv = np.concatenate([advs[j] for j, path in enumerate(paths) if path["mask"][j])
             standardized_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-            # Fit value function
-            vtarg = np.concatenate(vtargs)
-            vf.fit(ob, vtarg)  # fit!
-            ev_after = explained_variance_1d(np.squeeze(vf.predict(ob)), vtarg)
 
             feed = {
                 sy_ob: ob,
@@ -632,10 +611,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             kl_y += [kl]
             kl_points_by_head[i]._y = kl_y  # XXX: bug in matplotlib
             kl_points_by_head[i].set_data(iter_x, kl_y)
-            ev_y = ev_y_by_head[i]
-            ev_y += [ev_after]
-            ev_points_by_head[i]._y = ev_y  # XXX: bug in matplotlib
-            ev_points_by_head[i].set_data(iter_x, ev_y)
             # ----- PLOTTING
 
             max_kl = max(max_kl, kl)
@@ -646,7 +621,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         # Log diagnostics
         logz.log_tabular("Head", bootstrap_i)
         ep_rew_mean = np.mean([path["reward"].sum() for path in paths])
-        ep_avg_history[bootstrap_i].append(ep_rew_mean)
         logz.log_tabular("EpRewMean", ep_rew_mean)
         logz.log_tabular("EpLenMean", np.mean([pathlength(path) for path in paths]))
         logz.log_tabular("KLOldNew", max_kl)
@@ -672,6 +646,12 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         # recompute loss axis
         rew_ax.relim()
         rew_ax.autoscale()
+        ev_before_y += [ev_before]
+        ev_after_y += [ev_after]
+        ev_before_points[i]._y = ev_before_y  # XXX: bug in matplotlib
+        ev_before_points[i].set_data(iter_x, ev_before_y)
+        ev_after_points[i]._y = ev_after_y  # XXX: bug in matplotlib
+        ev_after_points[i].set_data(iter_x, ev_after_y)
 
         if iter_i > 45:
             x_start += 1
@@ -682,13 +662,13 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             plt.pause(0.05)
         else:
             dynamic_html.content = mpld3.fig_to_html(fig)
-            global SERVER_STARTED
-            if not SERVER_STARTED:
+            global PROC_SERVER_THREAD
+            if PROC_SERVER_THREAD is None:
                 def d3show():
                     mpld3.show(dynamic=dynamic_html, refresh_rate=REFRESH_RATE, ip='0.0.0.0',
                                port=mpld3_start_port + (bootstrap_heads - 1))
-                threading.Thread(target=d3show, args=()).start()
-                SERVER_STARTED = True
+                PROC_SERVER_THREAD = threading.Thread(target=d3show, args=())
+                PROC_SERVER_THREAD.start()
         # ------- PLOTTING
         sys.stderr.flush()
         sys.stdout.flush()
@@ -717,7 +697,7 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3
          vf_epochs, softmax_temp):
     bootstrap_heads = [int(k) for k in bootstrap_heads.split(',')]
 
-    general_params = dict(
+    shared_params = dict(
         animate=False,
         n_iter=n_iter,
         gamma=gamma,
@@ -728,12 +708,16 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3
         logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
         gym_env=env,
         initial_stepsize=1e-3,
-        desired_kl=desired_kl,
         mpld3_start_port=mpld3_start_port,
         softmax_temp=softmax_temp,
     )
 
-    params = [dict(bootstrap_heads=k, **general_params) for k in bootstrap_heads]
+    params = [dict(
+        bootstrap_heads=k,
+        desired_kl=(desired_kl / k),
+        **shared_params
+    ) for k in bootstrap_heads]
+
     p = multiprocessing.Pool(len(bootstrap_heads))
     p.map(_main1, params)
 

@@ -3,6 +3,7 @@
 Reference implementation: https://github.com/wojzaremba/trpo
 """
 
+import sys
 import atexit
 import click
 import gym
@@ -24,9 +25,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt  # noqa
 import mpld3_custom.mpld3 as mpld3  # noqa
 import seaborn as sns  # noqa
-
-logger = logging.getLogger('trpo')
-logger.setLevel(logging.DEBUG)
 
 
 MACHINE_EPS = np.finfo(np.float32).eps
@@ -215,10 +213,12 @@ class LinearValueFunction:
 
 
 class NnValueFunction:
-    def __init__(self, ob_dim, n_epochs=20, stepsize=1e-3):
+    def __init__(self, ob_dim, n_epochs=20, stepsize=1e-3, logfile=None, bootstrap_i=None):
         self.ob_dim = ob_dim
         self.n_epochs = n_epochs
         self.stepsize = stepsize
+        self.logfile = logfile
+        self.bootstrap_i = bootstrap_i
         self.init_tf()
 
     def init_tf(self):
@@ -235,8 +235,8 @@ class NnValueFunction:
         self.update_op = tf.train.AdamOptimizer(self.stepsize).minimize(loss)
 
     def fit(self, X, y):
-        logger.info('Fitting NNValueFunction')
-        for _ in tqdm(range(self.n_epochs)):
+        print('Fitting NNValueFunction for head {}'.format(self.bootstrap_i))
+        for _ in tqdm(range(self.n_epochs), file=self.logfile):
             self.update_op.run(feed_dict={
                 self.sy_ob: X,
                 self.sy_targ_v: y,
@@ -250,13 +250,19 @@ class NnValueFunction:
 
 def dump_stats(logdir, k, stats):
     os.makedirs(logdir, exist_ok=True)
-    statfile_path = osp.join(logdir, 'k{}_{}_stats.pkl'.format(k, str(os.getpid())))
+    statfile_path = osp.join(logdir, 'k{}_{}_stats.pkl'.format(k, os.getpid()))
     with open(statfile_path, 'wb') as f:
         pickle.dump(stats, f)
 
 def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,  # noqa
           initial_stepsize, desired_kl, vf_type, vf_params, animate=False,
           mpld3_start_port=-1, softmax_temp=250):
+
+    os.makedirs(logdir, exist_ok=True)
+    logfile_path = osp.join(logdir, 'k{}_{}.log'.format(bootstrap_heads, os.getpid()))
+    logfile = open(logfile_path, 'w')
+    sys.stderr = sys.stdout
+    sys.stdout = logfile
 
     tf.set_random_seed(seed)
     np.random.seed(seed)
@@ -272,7 +278,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             vf = {
                 'linear': LinearValueFunction,
                 'nn': NnValueFunction,
-            }[vf_type](ob_dim, **vf_params)
+            }[vf_type](ob_dim, logfile=logfile, bootstrap_i=i, **vf_params)
             vfs += [vf]
 
     with tf.variable_scope('shared'):
@@ -467,16 +473,17 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         for k in range(bootstrap_heads):
             past_ep_avg[k] = np.mean(np.array(ep_avg_history[k]))
 
-        if any(np.isnan(past_ep_avg)):
-            bootstrap_i = np.random.randint(bootstrap_heads)
-        else:
-            print('past_ep_avg:', past_ep_avg)
-            past_ep_avg_softmax = softmax(past_ep_avg / softmax_temp)
-            print('softmax:', past_ep_avg_softmax)
-            bootstrap_i = np.random.choice(bootstrap_heads, p=past_ep_avg_softmax)
+        # if any(np.isnan(past_ep_avg)):
+        #     bootstrap_i = np.random.randint(bootstrap_heads)
+        # else:
+        #     print('past_ep_avg:', past_ep_avg)
+        #     past_ep_avg_softmax = softmax(past_ep_avg / softmax_temp)
+        #     print('softmax:', past_ep_avg_softmax)
+        #     bootstrap_i = np.random.choice(bootstrap_heads, p=past_ep_avg_softmax)
+        bootstrap_i = np.random.randint(bootstrap_heads)
 
         # bootstrap_i = sample_bootstrap_heads(rewards_saved)
-        logger.info('Sampled head %d', bootstrap_i)
+        print('Sampled head', bootstrap_i)
 
         sy_sampled_ac = sy_sampled_acs[bootstrap_i]
         sy_mean = sy_means[bootstrap_i]
@@ -488,41 +495,41 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         timesteps_this_batch = 0
         episodes_this_batch = 0
         paths = []
-        with tqdm(total=min_timesteps_per_batch) as pbar:
+        with tqdm(total=min_timesteps_per_batch, file=logfile) as pbar:
+            while True:
+                ob = env.reset().reshape((ob_dim,)); pbar.update(1)  # noqa
+                terminated = False
+                obs, acs, rewards, means = [], [], [], []
+                animate_this_episode = (len(paths) == 0 and (i % 10 == 0) and animate)
                 while True:
-                    ob = env.reset().reshape((ob_dim,)); pbar.update(1)  # noqa
-                    terminated = False
-                    obs, acs, rewards, means = [], [], [], []
-                    animate_this_episode = (len(paths) == 0 and (i % 10 == 0) and animate)
-                    while True:
-                        if animate_this_episode:
-                            env.render()
+                    if animate_this_episode:
+                        env.render()
 
-                        obs.append(ob)
-                        mean, ac = sess.run([sy_mean, sy_sampled_ac],
-                                            feed_dict={sy_ob: ob[None]})
+                    obs.append(ob)
+                    mean, ac = sess.run([sy_mean, sy_sampled_ac],
+                                        feed_dict={sy_ob: ob[None]})
 
-                        means.append(np.squeeze(mean, axis=0))
-                        ac = np.squeeze(ac, axis=0)
-                        acs.append(ac)
-                        ob, rew, done, _ = env.step(ac); pbar.update(1)  # noqa
-                        ob = np.squeeze(ob)
+                    means.append(np.squeeze(mean, axis=0))
+                    ac = np.squeeze(ac, axis=0)
+                    acs.append(ac)
+                    ob, rew, done, _ = env.step(ac); pbar.update(1)  # noqa
+                    ob = np.squeeze(ob)
 
-                        rewards.append(rew)
-                        if done:
-                            break
-
-                    path = {"observation": np.array(obs),
-                            "terminated": terminated,
-                            "reward": np.array(rewards),
-                            "action": np.array(acs),
-                            "dist_means": np.array(means),
-                            "mask": (np.random.rand(bootstrap_heads) > 0.5) if bootstrap_heads > 1 else np.array([True])}
-                    paths.append(path)
-                    episodes_this_batch += 1
-                    timesteps_this_batch += pathlength(path)
-                    if timesteps_this_batch > min_timesteps_per_batch:
+                    rewards.append(rew)
+                    if done:
                         break
+
+                path = {"observation": np.array(obs),
+                        "terminated": terminated,
+                        "reward": np.array(rewards),
+                        "action": np.array(acs),
+                        "dist_means": np.array(means),
+                        "mask": (np.random.rand(bootstrap_heads) > 0.5) if bootstrap_heads > 1 else np.array([True])}
+                paths.append(path)
+                episodes_this_batch += 1
+                timesteps_this_batch += pathlength(path)
+                if timesteps_this_batch > min_timesteps_per_batch:
+                    break
 
         total_episodes += episodes_this_batch
         total_timesteps += timesteps_this_batch
@@ -683,6 +690,10 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
                 threading.Thread(target=d3show, args=()).start()
                 SERVER_STARTED = True
         # ------- PLOTTING
+        sys.stderr.flush()
+        sys.stdout.flush()
+
+    logfile.close()
 
 
 def _main1(d):

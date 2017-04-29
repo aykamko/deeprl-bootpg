@@ -6,26 +6,24 @@ Reference implementation: https://github.com/wojzaremba/trpo
 import threading
 import numpy as np
 import tensorflow as tf
-from tensorflow.python import debug as tf_debug
 import gym
 import logz
 import scipy.signal
 import os
 import click
 import logging
+import matplotlib.pyplot as plt
+import mpld3_custom.mpld3 as mpld3
+import seaborn as sns  # noqa
+import atexit
+import pickle
+from os import path as osp
+from tqdm import tqdm
+
 if os.getenv('SSH_CLIENT'):
     # Servers don't always have X installed/running
     import matplotlib
     matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import sys
-import mpld3_custom.mpld3 as mpld3
-import seaborn as sns
-import atexit
-import pickle
-
-from os import path as osp
-from tqdm import tqdm
 
 logger = logging.getLogger('trpo')
 logger.setLevel(logging.DEBUG)
@@ -251,7 +249,7 @@ def dump_stats(logdir, stats):
         pickle.dump(stats, f)
 
 
-def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,
+def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,  # noqa
           initial_stepsize, initial_reward, desired_kl, vf_type, vf_params, animate=False,
           mpld3_port=-1):
 
@@ -374,7 +372,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         sy_thetas += [sy_theta]
 
     sess = tf.Session()
-    #sess = tf_debug.LocalCLIDebugWrapperSession(sess)
+    # sess = tf_debug.LocalCLIDebugWrapperSession(sess)
     sess.__enter__()  # equivalent to `with sess:`
     tf.global_variables_initializer().run()  # pylint: disable=E1101
 
@@ -467,7 +465,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         paths = []
         with tqdm(total=min_timesteps_per_batch) as pbar:
                 while True:
-                    ob = env.reset().reshape((ob_dim,)); pbar.update(1)
+                    ob = env.reset().reshape((ob_dim,)); pbar.update(1)  # noqa
                     terminated = False
                     obs, acs, rewards, means = [], [], [], []
                     animate_this_episode = (len(paths) == 0 and (i % 10 == 0) and animate)
@@ -482,7 +480,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
                         means.append(np.squeeze(mean, axis=0))
                         ac = np.squeeze(ac, axis=0)
                         acs.append(ac)
-                        ob, rew, done, _ = env.step(ac); pbar.update(1)
+                        ob, rew, done, _ = env.step(ac); pbar.update(1)  # noqa
                         ob = np.squeeze(ob)
 
                         rewards.append(rew)
@@ -563,8 +561,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
 
             theta_old = op_get_vars_flat.eval()
             policy_grad = sy_policy_grad.eval(feed_dict=feed)
-
-
             stepdir = conjugate_gradient(fisher_vector_product, -policy_grad)
 
             fvp = fisher_vector_product(stepdir)

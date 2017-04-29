@@ -324,7 +324,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             sy_old_ac_prob = tf.squeeze(sy_old_dist.prob(sy_ac))
             sy_ac_prob_ratio = sy_ac_prob / (sy_old_ac_prob + MACHINE_EPS)
             if ac_dim > 1:
-                sy_ac_prob_ratio = np.reduce_prod(sy_ac_prob_ratio, axis=1)
+                sy_ac_prob_ratio = tf.reduce_prod(sy_ac_prob_ratio, axis=1)
             sy_surr = -tf.reduce_mean(sy_ac_prob_ratio * sy_adv)
 
             # sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))

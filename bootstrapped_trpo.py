@@ -8,23 +8,21 @@ import click
 import gym
 import inspect
 import logging
-import logz
-import matplotlib.pyplot as plt
-import mpld3_custom.mpld3 as mpld3
 import numpy as np
 import os
 import pickle
 import scipy.signal
-import seaborn as sns  # noqa
 import tensorflow as tf
+import logz
 import threading
+import multiprocessing
 from os import path as osp
 from tqdm import tqdm
-
-if os.getenv('SSH_CLIENT'):
-    # Servers don't always have X installed/running
-    import matplotlib
-    matplotlib.use('Agg')
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt  # noqa
+import mpld3_custom.mpld3 as mpld3  # noqa
+import seaborn as sns  # noqa
 
 logger = logging.getLogger('trpo')
 logger.setLevel(logging.DEBUG)
@@ -35,7 +33,7 @@ CG_DAMP = 0.1
 ROLL_MEM_SIZE = 1000
 CLEAR_LOGS = True
 
-REFRESH_RATE = 3
+REFRESH_RATE = -1
 SERVER_STARTED = False
 
 
@@ -249,10 +247,9 @@ def dump_stats(logdir, stats):
     with open(statfile_path, 'wb') as f:
         pickle.dump(stats, f)
 
-
 def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,  # noqa
-          initial_stepsize, initial_reward, desired_kl, vf_type, vf_params, animate=False,
-          mpld3_port=-1):
+          initial_stepsize, desired_kl, vf_type, vf_params, animate=False,
+          mpld3_start_port=-1):
 
     tf.set_random_seed(seed)
     np.random.seed(seed)
@@ -382,8 +379,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     total_timesteps = 0
     total_episodes = 0
 
-    rewards_saved = [initial_reward for _ in range(bootstrap_heads)]
-
     # ----- PLOTTING
     dynamic_html = mpld3.DynamicHTML(None)
     fig, axes = plt.subplots(4, 1, figsize=(7, 8))
@@ -441,8 +436,9 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     # ----- PLOTTING
 
     args, _, _, values = inspect.getargvalues(inspect.currentframe())
+    program_args = {arg: values[arg] for arg in args}
     atexit.register(dump_stats, logdir, {
-        'program_args': dict(zip(args, values)),
+        'program_args': program_args,
         'rew_x_by_head': rew_x_by_head,
         'rew_y_by_head': rew_y_by_head,
         'iter_x': iter_x,
@@ -617,7 +613,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             avg_ent += ent
 
         avg_ent /= bootstrap_heads
-        rewards_saved[bootstrap_i] = np.mean([path["reward"].sum() for path in paths])
 
         # Log diagnostics
         logz.log_tabular("Head", bootstrap_i)
@@ -653,46 +648,54 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             x_end += 1
         set_xbounds()
 
-        if mpld3_port < 0:
+        if mpld3_start_port < 0:
             plt.pause(0.05)
         else:
             dynamic_html.content = mpld3.fig_to_html(fig)
             global SERVER_STARTED
             if not SERVER_STARTED:
                 def d3show():
-                    mpld3.show(dynamic=dynamic_html, refresh_rate=REFRESH_RATE, ip='0.0.0.0', port=mpld3_port)
+                    mpld3.show(dynamic=dynamic_html, refresh_rate=REFRESH_RATE, ip='0.0.0.0',
+                               port=mpld3_start_port + (bootstrap_heads - 1))
                 threading.Thread(target=d3show, args=()).start()
                 SERVER_STARTED = True
         # ------- PLOTTING
 
 
+def _main1(d):
+    return _main(**d)
+
+
 @click.command()
 @click.option('--env', default='Pendulum-v0')
 @click.option('--gamma', '-g', default=0.97)
-@click.option('--bootstrap-heads', '-k', default=1)
+@click.option('--bootstrap-heads', '-k', default='1')
 @click.option('--batch-timesteps', '-t', default=10000)
 @click.option('--desired-kl', default=2e-3)
 @click.option('--n-iter', default=400)
-@click.option('--mpld3-port', default=-1)
+@click.option('--mpld3-start-port', default=-1)
 @click.option('--vf-epochs', default=10)
-def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3_port, vf_epochs):
-    _main(
-        gym_env=env,
-        logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
+def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3_start_port, vf_epochs):
+    bootstrap_heads = [int(k) for k in bootstrap_heads.split(',')]
+
+    general_params = dict(
         animate=False,
-        gamma=gamma,
-        bootstrap_heads=bootstrap_heads,
-        # min_timesteps_per_batch=(bootstrap_heads * batch_timesteps),
-        min_timesteps_per_batch=batch_timesteps,
         n_iter=n_iter,
-        initial_stepsize=1e-3,
-        initial_reward=-650,
-        seed=0,
-        desired_kl=desired_kl,
-        vf_type='nn',
+        gamma=gamma,
+        min_timesteps_per_batch=batch_timesteps,
         vf_params={'n_epochs': vf_epochs},
-        mpld3_port=mpld3_port,
+        vf_type='nn',
+        seed=0,
+        logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
+        gym_env=env,
+        initial_stepsize=1e-3,
+        desired_kl=desired_kl,
+        mpld3_start_port=mpld3_start_port,
     )
+
+    params = [dict(bootstrap_heads=k, **general_params) for k in bootstrap_heads]
+    p = multiprocessing.Pool(len(bootstrap_heads))
+    p.map(_main1, params)
 
 
 if __name__ == '__main__':

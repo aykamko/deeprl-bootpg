@@ -8,7 +8,6 @@ import atexit
 import click
 import gym
 import inspect
-import logging
 import numpy as np
 import os
 import pickle
@@ -19,7 +18,6 @@ import threading
 import multiprocessing
 from os import path as osp
 from tqdm import tqdm
-from numpy_ringbuffer import RingBuffer
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt  # noqa
@@ -107,15 +105,6 @@ def lrelu(x, leak=0.2):
     f1 = 0.5 * (1 + leak)
     f2 = 0.5 * (1 - leak)
     return f1 * x + f2 * abs(x)
-
-
-def sample_bootstrap_heads(rewards):
-    heads = len(rewards)
-    min_reward, min_head = min((rewards[i], i) for i in range(heads))
-    head = np.random.randint(heads+1)
-    if head == heads:
-        head = min_head
-    return head
 
 
 def flatgrad(loss, tfvars):
@@ -256,9 +245,58 @@ def dump_stats(logdir, k, stats):
     with open(statfile_path, 'wb') as f:
         pickle.dump(stats, f)
 
+
+def gen_rollout(sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mean, sy_logstd,
+                num_bootstrap_heads, logfile=None, animate=False):
+    timesteps_this_batch = 0
+    episodes_this_batch = 0
+    paths = []
+    with tqdm(total=min_timesteps_per_batch, file=logfile) as pbar:
+        while True:
+            ob = np.squeeze(env.reset()); pbar.update(1)  # noqa
+            terminated = False
+            obs, acs, rewards, means = [], [], [], []
+            # animate_this_episode = (len(paths) == 0 and (i % 10 == 0) and animate)
+            animate_this_episode = (len(paths) == 0 and animate)
+            while True:
+                if animate_this_episode:
+                    env.render()
+
+                obs.append(ob)
+                mean, ac = sess.run([sy_mean, sy_sampled_ac],
+                                    feed_dict={sy_ob: ob[None]})
+
+                means.append(np.squeeze(mean, axis=0))
+                ac = np.squeeze(ac, axis=0)
+                acs.append(ac)
+                ob, rew, done, _ = env.step(ac); pbar.update(1)  # noqa
+                ob = np.squeeze(ob)
+
+                rewards.append(rew)
+                if done:
+                    break
+
+            if num_bootstrap_heads > 1:
+                mask = np.random.rand(num_bootstrap_heads) < BERNOULLI_P
+            else:
+                mask = np.array([True])
+            path = {"observation": np.array(obs),
+                    "terminated": terminated,
+                    "reward": np.array(rewards),
+                    "action": np.array(acs),
+                    "dist_means": np.array(means),
+                    "mask": mask}
+            paths.append(path)
+            episodes_this_batch += 1
+            timesteps_this_batch += pathlength(path)
+            if timesteps_this_batch > min_timesteps_per_batch:
+                break
+
+        return paths, episodes_this_batch, timesteps_this_batch
+
 def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,  # noqa
-          desired_kl, vf_type, vf_params, animate=False,
-          mpld3_start_port=-1, softmax_temp=250):
+          desired_kl, vf_type, vf_params, eval_every, animate=False,
+          mpld3_start_port=-1):
 
     os.makedirs(logdir, exist_ok=True)
     logfile_path = osp.join(logdir, 'k{}_{}.log'.format(bootstrap_heads, os.getpid()))
@@ -452,58 +490,17 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         iter_x += [iter_i]
 
         bootstrap_i = np.random.randint(bootstrap_heads)
-
-        # bootstrap_i = sample_bootstrap_heads(rewards_saved)
         print('Sampled head', bootstrap_i)
 
         sy_sampled_ac = sy_sampled_acs[bootstrap_i]
         sy_mean = sy_means[bootstrap_i]
         sy_logstd = sy_logstds[bootstrap_i]
 
-        # Collect paths until we have enough timesteps
+        # Generate rollout
         old_logstd = sy_logstd.eval()
-        timesteps_this_batch = 0
-        episodes_this_batch = 0
-        paths = []
-        with tqdm(total=min_timesteps_per_batch, file=logfile) as pbar:
-            while True:
-                ob = env.reset().reshape((ob_dim,)); pbar.update(1)  # noqa
-                terminated = False
-                obs, acs, rewards, means = [], [], [], []
-                animate_this_episode = (len(paths) == 0 and (i % 10 == 0) and animate)
-                while True:
-                    if animate_this_episode:
-                        env.render()
-
-                    obs.append(ob)
-                    mean, ac = sess.run([sy_mean, sy_sampled_ac],
-                                        feed_dict={sy_ob: ob[None]})
-
-                    means.append(np.squeeze(mean, axis=0))
-                    ac = np.squeeze(ac, axis=0)
-                    acs.append(ac)
-                    ob, rew, done, _ = env.step(ac); pbar.update(1)  # noqa
-                    ob = np.squeeze(ob)
-
-                    rewards.append(rew)
-                    if done:
-                        break
-
-                if bootstrap_heads > 1:
-                    mask = np.random.rand(bootstrap_heads) < BERNOULLI_P
-                else:
-                    mask = np.array([True])
-                path = {"observation": np.array(obs),
-                        "terminated": terminated,
-                        "reward": np.array(rewards),
-                        "action": np.array(acs),
-                        "dist_means": np.array(means),
-                        "mask": mask}
-                paths.append(path)
-                episodes_this_batch += 1
-                timesteps_this_batch += pathlength(path)
-                if timesteps_this_batch > min_timesteps_per_batch:
-                    break
+        paths, episodes_this_batch, timesteps_this_batch = gen_rollout(
+            sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mean, sy_logstd,
+            bootstrap_heads, logfile, (i % 10 == 0 and animate))
 
         total_episodes += episodes_this_batch
         total_timesteps += timesteps_this_batch
@@ -683,9 +680,9 @@ def _main1(d):
 @click.option('--n-iter', default=400)
 @click.option('--mpld3-start-port', default=-1)
 @click.option('--vf-epochs', default=25)
-@click.option('--softmax-temp', default=250)
+@click.option('--eval-every', default=10)
 def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3_start_port,
-         vf_epochs, softmax_temp):
+         vf_epochs, eval_every):
     bootstrap_heads = [int(k) for k in bootstrap_heads.split(',')]
 
     shared_params = dict(
@@ -699,7 +696,7 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3
         logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
         gym_env=env,
         mpld3_start_port=mpld3_start_port,
-        softmax_temp=softmax_temp,
+        eval_every=eval_every,
     )
 
     params = [dict(

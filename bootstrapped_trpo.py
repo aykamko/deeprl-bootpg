@@ -37,6 +37,22 @@ PROC_SERVER_THREAD = None
 BERNOULLI_P = 1.0
 
 
+# disable print buffering: http://stackoverflow.com/a/107717
+class Unbuffered:
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, data):
+        self.stream.write(data)
+        self.stream.flush()
+
+    def __getattr__(self, attr):
+        return getattr(self.stream, attr)
+
+
+sys.stdout = Unbuffered(sys.stdout)
+
+
 class RollingMem:
     def __init__(self, maxlen=ROLL_MEM_SIZE):
         self.maxlen = maxlen
@@ -509,7 +525,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
                     sess, env, eval_timesteps, sy_ob, sy_sampled_ac, sy_mean, sy_logstd,
                     mask_func, logfile, False)
 
-                rew_means[i] = np.mean([path['reward'].sum() for path in paths])
+                rew_means[head_i] = np.mean([path['reward'].sum() for path in paths])
 
             print('Eval Reward Averages:')
             print(rew_means)

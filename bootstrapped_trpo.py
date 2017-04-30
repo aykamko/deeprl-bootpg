@@ -204,12 +204,12 @@ class LinearValueFunction:
 
 
 class NnValueFunction:
-    def __init__(self, ob_dim, n_epochs=20, stepsize=1e-3, logfile=None, bootstrap_i=None):
+    def __init__(self, ob_dim, n_epochs=20, stepsize=1e-3, logfile=None, rollout_head_i=None):
         self.ob_dim = ob_dim
         self.n_epochs = n_epochs
         self.stepsize = stepsize
         self.logfile = logfile
-        self.bootstrap_i = bootstrap_i
+        self.rollout_head_i = rollout_head_i
         self.init_tf()
 
     def init_tf(self):
@@ -226,7 +226,7 @@ class NnValueFunction:
         self.update_op = tf.train.AdamOptimizer(self.stepsize).minimize(loss)
 
     def fit(self, X, y):
-        print('Fitting NNValueFunction for head {}'.format(self.bootstrap_i))
+        print('Fitting NNValueFunction for head {}'.format(self.rollout_head_i))
         for _ in tqdm(range(self.n_epochs), file=self.logfile):
             self.update_op.run(feed_dict={
                 self.sy_ob: X,
@@ -247,7 +247,7 @@ def dump_stats(logdir, k, stats):
 
 
 def gen_rollout(sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mean, sy_logstd,
-                num_bootstrap_heads, logfile=None, animate=False):
+                mask_func, logfile=None, animate=False):
     timesteps_this_batch = 0
     episodes_this_batch = 0
     paths = []
@@ -256,7 +256,6 @@ def gen_rollout(sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mea
             ob = np.squeeze(env.reset()); pbar.update(1)  # noqa
             terminated = False
             obs, acs, rewards, means = [], [], [], []
-            # animate_this_episode = (len(paths) == 0 and (i % 10 == 0) and animate)
             animate_this_episode = (len(paths) == 0 and animate)
             while True:
                 if animate_this_episode:
@@ -276,16 +275,12 @@ def gen_rollout(sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mea
                 if done:
                     break
 
-            if num_bootstrap_heads > 1:
-                mask = np.random.rand(num_bootstrap_heads) < BERNOULLI_P
-            else:
-                mask = np.array([True])
             path = {"observation": np.array(obs),
                     "terminated": terminated,
                     "reward": np.array(rewards),
                     "action": np.array(acs),
                     "dist_means": np.array(means),
-                    "mask": mask}
+                    "mask": mask_func()}
             paths.append(path)
             episodes_this_batch += 1
             timesteps_this_batch += pathlength(path)
@@ -294,12 +289,12 @@ def gen_rollout(sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mea
 
         return paths, episodes_this_batch, timesteps_this_batch
 
-def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,  # noqa
-          desired_kl, vf_type, vf_params, eval_every, animate=False,
+def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_batch,  # noqa
+          desired_kl, vf_type, vf_params, eval_every, eval_timesteps, animate=False,
           mpld3_start_port=-1):
 
     os.makedirs(logdir, exist_ok=True)
-    logfile_path = osp.join(logdir, 'k{}_{}.log'.format(bootstrap_heads, os.getpid()))
+    logfile_path = osp.join(logdir, 'k{}_{}.log'.format(num_heads, os.getpid()))
     logfile = open(logfile_path, 'w')
     sys.stderr = sys.stdout
     sys.stdout = logfile
@@ -315,7 +310,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     vf = {
         'linear': LinearValueFunction,
         'nn': NnValueFunction,
-    }[vf_type](ob_dim, logfile=logfile, bootstrap_i=0, **vf_params)
+    }[vf_type](ob_dim, logfile=logfile, rollout_head_i=0, **vf_params)
 
     with tf.variable_scope('shared'):
         sy_ob = tf.placeholder(shape=[None, ob_dim], name='ob', dtype=tf.float32)  # batch of observations
@@ -342,7 +337,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     ops_set_vars_from_flat = []
     sy_thetas = []
 
-    for i in range(bootstrap_heads):
+    for i in range(num_heads):
         with tf.variable_scope('head%d' % i):
             sy_mean = dense(sy_h2, ac_dim, 'mean%d' % i, weight_init=normc_initializer(0.1))  # Mean control output
             sy_logstd = tf.get_variable('logstd%d' % i, [ac_dim], initializer=tf.zeros_initializer())  # Variance
@@ -419,8 +414,8 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
 
     # ----- PLOTTING
     dynamic_html = mpld3.DynamicHTML(None)
-    fig, axes = plt.subplots(4, 1, figsize=(7, 8))
-    rew_ax, loss_ax, kl_ax, ev_ax = axes
+    fig, axes = plt.subplots(5, 1, figsize=(8, 8))
+    rew_ax, loss_ax, kl_ax, ev_ax, evalrew_ax = axes
     plt.tight_layout(pad=2.0, h_pad=1.5)
 
     x_start = 0
@@ -435,7 +430,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     rew_y_by_head = []
     rew_x_by_head = []
     rew_points_by_head = []
-    for i in range(bootstrap_heads):
+    for i in range(num_heads):
         rew_y, rew_x = [], []
         rew_y_by_head += [rew_y]
         rew_x_by_head += [rew_x]
@@ -446,7 +441,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
 
     loss_ax.set_title('Loss (After train iteration, by head)')
     loss_y_by_head, loss_points_by_head = [], []
-    for i in range(bootstrap_heads):
+    for i in range(num_heads):
         loss_y = []
         loss_y_by_head += [loss_y]
         loss_points, = loss_ax.plot(iter_x, loss_y)
@@ -455,7 +450,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     kl_ax.set_title('KL')
     kl_ax.set_ylim(0, 2*desired_kl)
     kl_y_by_head, kl_points_by_head = [], []
-    for i in range(bootstrap_heads):
+    for i in range(num_heads):
         kl_y = []
         kl_y_by_head += [kl_y]
         kl_points, = kl_ax.plot(iter_x, kl_y)
@@ -468,13 +463,17 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
     ev_after_y = []
     ev_after_points, = ev_ax.plot(iter_x, ev_after_y)
 
+    evalrew_ax.set_title('Evaluation Average Reward (Best of all heads)')
+    evalrew_x, evalrew_y, evalrew_head_idx = [], [], []
+    evalrew_points, = evalrew_ax.plot(evalrew_x, evalrew_y)
+
     plt.ion()
     # ----- PLOTTING
 
     args, _, _, values = inspect.getargvalues(inspect.currentframe())
     program_args = {arg: values[arg] for arg in args}
 
-    atexit.register(dump_stats, logdir, bootstrap_heads, {
+    atexit.register(dump_stats, logdir, num_heads, {
         'program_args': program_args,
         'rew_x_by_head': rew_x_by_head,
         'rew_y_by_head': rew_y_by_head,
@@ -483,24 +482,64 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         'kl_y_by_head': kl_y_by_head,
         'ev_before_y': ev_before_y,
         'ev_after_y': ev_after_y,
+        'evalrew_x': evalrew_x,
+        'evalrew_y': evalrew_y,
+        'evalrew_head_idx': evalrew_head_idx,
     })
+
+    if num_heads > 1:
+        def mask_func():
+            return np.random.rand(num_heads) < BERNOULLI_P
+    else:
+        def mask_func():
+            return np.array([True])
 
     for iter_i in range(n_iter):
         print("********** Iteration %i ************" % iter_i)
+        if iter_i > 0 and iter_i % eval_every == 0:
+            print("========== Evaluation %i ============" % (iter_i / eval_every))
+            rew_means = np.empty(num_heads)
+            for head_i in range(num_heads):
+                sy_sampled_ac = sy_sampled_acs[head_i]
+                sy_mean = sy_means[head_i]
+                sy_logstd = sy_logstds[head_i]
+
+                print('Evaluating head %i' % head_i)
+                paths, _, _ = gen_rollout(
+                    sess, env, eval_timesteps, sy_ob, sy_sampled_ac, sy_mean, sy_logstd,
+                    mask_func, logfile, False)
+
+                rew_means[i] = np.mean([path['reward'].sum() for path in paths])
+
+            print('Eval Reward Averages:')
+            print(rew_means)
+
+            best_head_i = np.argmax(rew_means)
+            best_reward = rew_means[best_head_i]
+
+            print('### Best average, head %d: %f' % (best_head_i, best_reward))
+
+            evalrew_x += [iter_i]
+            evalrew_y += [best_reward]
+            evalrew_head_idx += [best_head_i]
+            evalrew_points._y = evalrew_y  # XXX: bug in matplotlib
+            evalrew_points.set_data(evalrew_x, evalrew_y)
+
         iter_x += [iter_i]
 
-        bootstrap_i = np.random.randint(bootstrap_heads)
-        print('Sampled head', bootstrap_i)
+        rollout_head_i = np.random.randint(num_heads)
+        print('Sampled head', rollout_head_i)
 
-        sy_sampled_ac = sy_sampled_acs[bootstrap_i]
-        sy_mean = sy_means[bootstrap_i]
-        sy_logstd = sy_logstds[bootstrap_i]
+        sy_sampled_ac = sy_sampled_acs[rollout_head_i]
+        sy_mean = sy_means[rollout_head_i]
+        sy_logstd = sy_logstds[rollout_head_i]
 
-        # Generate rollout
+        # ---- Generate rollout
         old_logstd = sy_logstd.eval()
         paths, episodes_this_batch, timesteps_this_batch = gen_rollout(
             sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mean, sy_logstd,
-            bootstrap_heads, logfile, (i % 10 == 0 and animate))
+            mask_func, logfile, (iter_i % 10 == 0 and animate))
+        # ----
 
         total_episodes += episodes_this_batch
         total_timesteps += timesteps_this_batch
@@ -525,7 +564,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
 
         max_kl = -np.inf
         avg_ent = 0
-        for i in range(bootstrap_heads):
+        for i in range(num_heads):
             sy_old_mean = sy_old_means[i]
             sy_old_logstd = sy_old_logstds[i]
             sy_kl = sy_kls[i]
@@ -606,10 +645,10 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             max_kl = max(max_kl, kl)
             avg_ent += ent
 
-        avg_ent /= bootstrap_heads
+        avg_ent /= num_heads
 
         # Log diagnostics
-        logz.log_tabular("Head", bootstrap_i)
+        logz.log_tabular("Head", rollout_head_i)
         ep_rew_mean = np.mean([path["reward"].sum() for path in paths])
         logz.log_tabular("EpRewMean", ep_rew_mean)
         logz.log_tabular("EpLenMean", np.mean([pathlength(path) for path in paths]))
@@ -625,12 +664,12 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         logz.dump_tabular()
 
         # ------- PLOTTING
-        rew_x = rew_x_by_head[bootstrap_i]
-        rew_y = rew_y_by_head[bootstrap_i]
+        rew_x = rew_x_by_head[rollout_head_i]
+        rew_y = rew_y_by_head[rollout_head_i]
         rew_x += [iter_i]
         rew_y += [ep_rew_mean]
-        rew_points_by_head[bootstrap_i]._y = rew_y  # XXX: bug in matplotlib
-        rew_points_by_head[bootstrap_i].set_data(rew_x, rew_y)
+        rew_points_by_head[rollout_head_i]._y = rew_y  # XXX: bug in matplotlib
+        rew_points_by_head[rollout_head_i].set_data(rew_x, rew_y)
         # recompute loss axis
         rew_ax.relim()
         rew_ax.autoscale()
@@ -654,7 +693,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             if PROC_SERVER_THREAD is None:
                 def d3show():
                     mpld3.show(dynamic=dynamic_html, refresh_rate=REFRESH_RATE, ip='0.0.0.0',
-                               port=mpld3_start_port + (bootstrap_heads - 1))
+                               port=mpld3_start_port + (num_heads - 1))
                 PROC_SERVER_THREAD = threading.Thread(target=d3show, args=())
                 PROC_SERVER_THREAD.start()
         # ------- PLOTTING
@@ -674,16 +713,17 @@ def _main1(d):
 @click.command()
 @click.option('--env', default='Pendulum-v0')
 @click.option('--gamma', '-g', default=0.97)
-@click.option('--bootstrap-heads', '-k', default='1')
+@click.option('--num-heads', '-k', default='1')
 @click.option('--batch-timesteps', '-t', default=10000)
 @click.option('--desired-kl', default=2e-3)
 @click.option('--n-iter', default=400)
 @click.option('--mpld3-start-port', default=-1)
 @click.option('--vf-epochs', default=25)
 @click.option('--eval-every', default=10)
-def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3_start_port,
-         vf_epochs, eval_every):
-    bootstrap_heads = [int(k) for k in bootstrap_heads.split(',')]
+@click.option('--eval-timesteps', default=10000)
+def main(num_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3_start_port,
+         vf_epochs, eval_every, eval_timesteps):
+    num_heads = [int(k) for k in num_heads.split(',')]
 
     shared_params = dict(
         animate=False,
@@ -697,15 +737,16 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3
         gym_env=env,
         mpld3_start_port=mpld3_start_port,
         eval_every=eval_every,
+        eval_timesteps=eval_timesteps,
     )
 
     params = [dict(
-        bootstrap_heads=k,
+        num_heads=k,
         desired_kl=(desired_kl / k),
         **shared_params
-    ) for k in bootstrap_heads]
+    ) for k in num_heads]
 
-    p = multiprocessing.Pool(len(bootstrap_heads))
+    p = multiprocessing.Pool(len(num_heads))
     p.map(_main1, params)
 
 

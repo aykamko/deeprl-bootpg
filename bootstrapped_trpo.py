@@ -257,7 +257,7 @@ def dump_stats(logdir, k, stats):
         pickle.dump(stats, f)
 
 def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_per_batch,  # noqa
-          initial_stepsize, desired_kl, vf_type, vf_params, animate=False,
+          desired_kl, vf_type, vf_params, animate=False,
           mpld3_start_port=-1, softmax_temp=250):
 
     os.makedirs(logdir, exist_ok=True)
@@ -315,8 +315,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             sy_old_mean = tf.placeholder(shape=[None, ac_dim], name='oldmean', dtype=tf.float32)
             sy_old_logstd = tf.placeholder(shape=[ac_dim], name='oldlogstd', dtype=tf.float32)
             sy_old_std = tf.exp(sy_old_logstd)
-            # sy_old_dist = tf.contrib.distributions.Normal(
-            #     name='olddist%d' % i, loc=sy_old_mean, scale=sy_old_std, validate_args=True)
             sy_old_dist = tf.contrib.distributions.Normal(
                 name='olddist%d' % i, loc=sy_old_mean, scale=sy_old_std, validate_args=True)
 
@@ -329,11 +327,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
                 sy_ac_prob_ratio = tf.reduce_prod(sy_ac_prob_ratio, axis=1)
             sy_surr = -tf.reduce_mean(sy_ac_prob_ratio * sy_adv)
 
-            # sy_ac_prob = tf.squeeze(sy_dist.prob(sy_ac))
-            # sy_ac_safe_prob = tf.maximum(sy_ac_prob, MACHINE_EPS)
-            # sy_ac_logprob = tf.log(sy_ac_safe_prob)
-            # sy_surr = -tf.reduce_mean(sy_ac_logprob * sy_adv)
-
             var_list = shared_vars + tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=('head%d' % i))
 
             sy_kl = tf.reduce_mean(tf.contrib.distributions.kl(sy_old_dist, sy_dist))
@@ -341,8 +334,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
 
             sy_policy_grad = flatgrad(sy_surr, var_list)
 
-            # sy_fixed_dist = tf.contrib.distributions.Normal(
-            #     loc=tf.stop_gradient(sy_mean), scale=tf.stop_gradient(sy_std))
             sy_fixed_dist = tf.contrib.distributions.Normal(
                 loc=tf.stop_gradient(sy_mean), scale=tf.stop_gradient(sy_std))
             sy_kl_firstfixed = tf.reduce_mean(tf.contrib.distributions.kl(sy_fixed_dist, sy_dist))
@@ -452,7 +443,8 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         'iter_x': iter_x,
         'loss_y_by_head': loss_y_by_head,
         'kl_y_by_head': kl_y_by_head,
-        'ev_y_by_head': ev_y_by_head,
+        'ev_before_y': ev_before_y,
+        'ev_after_y': ev_after_y,
     })
 
     for iter_i in range(n_iter):
@@ -497,7 +489,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
                     if done:
                         break
 
-		if bootstrap_heads > 1:
+                if bootstrap_heads > 1:
                     mask = np.random.rand(bootstrap_heads) < BERNOULLI_P
                 else:
                     mask = np.array([True])
@@ -530,8 +522,9 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         # Fit value function
         vtarg = np.concatenate(vtargs)
         ev_before = explained_variance_1d(np.concatenate(baselines), vtarg)
-        vf.fit(ob, vtarg)  # fit!
-        ev_after = explained_variance_1d(np.squeeze(vf.predict(ob)), vtarg)
+        all_ob = np.concatenate([path["observation"] for path in paths])
+        vf.fit(all_ob, vtarg)  # fit!
+        ev_after = explained_variance_1d(np.squeeze(vf.predict(all_ob)), vtarg)
 
         max_kl = -np.inf
         avg_ent = 0
@@ -552,7 +545,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
             ob = np.concatenate([path["observation"] for path in paths if path["mask"][i]])
             ac = np.concatenate([path["action"] for path in paths if path["mask"][i]])
             old_means = np.concatenate([path["dist_means"] for path in paths if path["mask"][i]])
-            adv = np.concatenate([advs[j] for j, path in enumerate(paths) if path["mask"][j])
+            adv = np.concatenate([advs[j] for j, path in enumerate(paths) if path["mask"][i]])
             standardized_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
             feed = {
@@ -625,15 +618,13 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         logz.log_tabular("EpLenMean", np.mean([pathlength(path) for path in paths]))
         logz.log_tabular("KLOldNew", max_kl)
         logz.log_tabular("AvgEntropy", avg_ent)
-        # logz.log_tabular("EVBefore", ev_before)
-        # logz.log_tabular("EVAfter", ev_after)
+        logz.log_tabular("EVBefore", ev_before)
+        logz.log_tabular("EVAfter", ev_after)
         logz.log_tabular("SurrAfter", surr_after)
         logz.log_tabular("TimestepsSoFar", total_timesteps)
         logz.log_tabular("EpisodesSoFar", total_episodes)
         logz.log_tabular("BatchTimesteps", timesteps_this_batch)
         logz.log_tabular("BatchEpisodes", episodes_this_batch)
-        # If you're overfitting, EVAfter will be way larger than EVBefore.
-        # Note that we fit value function AFTER using it to compute the advantage function to avoid introducing bias
         logz.dump_tabular()
 
         # ------- PLOTTING
@@ -648,13 +639,13 @@ def _main(gym_env, logdir, seed, n_iter, gamma, bootstrap_heads, min_timesteps_p
         rew_ax.autoscale()
         ev_before_y += [ev_before]
         ev_after_y += [ev_after]
-        ev_before_points[i]._y = ev_before_y  # XXX: bug in matplotlib
-        ev_before_points[i].set_data(iter_x, ev_before_y)
-        ev_after_points[i]._y = ev_after_y  # XXX: bug in matplotlib
-        ev_after_points[i].set_data(iter_x, ev_after_y)
+        ev_before_points._y = ev_before_y  # XXX: bug in matplotlib
+        ev_before_points.set_data(iter_x, ev_before_y)
+        ev_after_points._y = ev_after_y  # XXX: bug in matplotlib
+        ev_after_points.set_data(iter_x, ev_after_y)
 
         if iter_i > 45:
-            x_start += 1
+            # x_start += 1
             x_end += 1
         set_xbounds()
 
@@ -707,7 +698,6 @@ def main(bootstrap_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3
         seed=0,
         logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
         gym_env=env,
-        initial_stepsize=1e-3,
         mpld3_start_port=mpld3_start_port,
         softmax_temp=softmax_temp,
     )

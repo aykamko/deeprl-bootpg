@@ -311,7 +311,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
 
     os.makedirs(logdir, exist_ok=True)
     logfile_path = osp.join(logdir, 'k{}_{}.log'.format(num_heads, os.getpid()))
-    logfile = open(logfile_path, 'w')
+    logfile = Unbuffered(open(logfile_path, 'w'))
     sys.stderr = sys.stdout
     sys.stdout = logfile
 
@@ -481,7 +481,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
 
     evalrew_ax.set_title('Evaluation Average Reward (Best of all heads)')
     evalrew_x, evalrew_y, evalrew_head_idx = [], [], []
-    evalrew_points, = evalrew_ax.plot(evalrew_x, evalrew_y)
+    evalrew_points, = evalrew_ax.plot(evalrew_x, evalrew_y, marker='.')
 
     plt.ion()
     # ----- PLOTTING
@@ -540,6 +540,8 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
             evalrew_head_idx += [best_head_i]
             evalrew_points._y = evalrew_y  # XXX: bug in matplotlib
             evalrew_points.set_data(evalrew_x, evalrew_y)
+            evalrew_ax.relim()
+            evalrew_ax.autoscale()
 
         iter_x += [iter_i]
 

@@ -230,7 +230,7 @@ class NnValueFunction:
         self.init_tf()
 
     def init_tf(self):
-        self.sy_ob = tf.placeholder(shape=[None, self.ob_dim], name='v_ob', dtype=tf.float32)
+        self.sy_ob = tf.placeholder(shape=[None, self.ob_dim + 1], name='v_ob', dtype=tf.float32)
 
         sy_h1 = tf.nn.elu(dense(self.sy_ob, 64, "v_h1", weight_init=normc_initializer(1.0)))
         sy_h2 = tf.nn.elu(dense(sy_h1, 64, "v_h2", weight_init=normc_initializer(1.0)))
@@ -438,6 +438,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         ops_set_vars_from_flat += [op_set_vars_from_flat]
         sy_thetas += [sy_theta]
 
+    saver = tf.train.Saver()
     sess = tf.Session()
     # sess = tf_debug.LocalCLIDebugWrapperSession(sess)
     sess.__enter__()  # equivalent to `with sess:`
@@ -527,6 +528,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         def mask_func():
             return np.array([True])
 
+    best_overall_evalrew = -np.inf
     for iter_i in range(n_iter):
         print("********** Iteration %i ************" % iter_i)
         if iter_i > 0 and iter_i % eval_every == 0:
@@ -549,8 +551,17 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
 
             best_head_i = np.argmax(rew_means)
             best_reward = rew_means[best_head_i]
-
             print('### Best average, head %d: %f' % (best_head_i, best_reward))
+
+            if best_reward >= best_overall_evalrew:
+                best_overall_evalrew = best_reward
+
+                model_subdir = osp.join(logdir, 'model_s{}_k{}_{}'.format(seed, num_heads, os.getpid()))
+                os.makedirs(model_subdir, exist_ok=True)
+                symlink(model_subdir, osp.join(logdir, 'model_s{}_k{}'.format(seed, num_heads)))
+
+                model_path = osp.join(model_subdir, 'model_h{}'.format(best_head_i))
+                saver.save(sess, model_path, global_step=iter_i, write_meta_graph=False)
 
             evalrew_x += [iter_i]
             evalrew_y += [best_reward]
@@ -586,7 +597,8 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
             rew_t = path["reward"]
             return_t = discount(rew_t, gamma)
             path_obs = path["observation"]
-            baseline_t = vf.predict(path_obs)
+            path_obs_with_head_idx = np.hstack((path_obs, (np.ones((path_obs.shape[0], 1)) * rollout_head_i)))
+            baseline_t = vf.predict(path_obs_with_head_idx)
             baselines.append(baseline_t)
             adv_t = return_t - baseline_t
             advs.append(adv_t)
@@ -595,8 +607,9 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         vtarg = np.concatenate(vtargs)
         ev_before = explained_variance_1d(np.concatenate(baselines), vtarg)
         all_obs = np.concatenate([path["observation"] for path in paths])
-        vf.fit(all_obs, vtarg)  # fit!
-        ev_after = explained_variance_1d(np.squeeze(vf.predict(all_obs)), vtarg)
+        all_obs_with_head_idx = np.hstack((all_obs, (np.ones((all_obs.shape[0], 1)) * rollout_head_i)))
+        vf.fit(all_obs_with_head_idx, vtarg)  # fit!
+        ev_after = explained_variance_1d(np.squeeze(vf.predict(all_obs_with_head_idx)), vtarg)
 
         max_kl = -np.inf
         avg_ent = 0

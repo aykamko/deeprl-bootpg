@@ -520,8 +520,8 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         'loss_y_by_head': loss_y_by_head,
         'kl_y_by_head': kl_y_by_head,
         'ev_x_by_head': ev_x_by_head,
-        'ev_before_y_by_head': ev_before_y,
-        'ev_after_y_by_head': ev_after_y,
+        'ev_before_y_by_head': ev_before_y_by_head,
+        'ev_after_y_by_head': ev_after_y_by_head,
         'evalrew_x': evalrew_x,
         'evalrew_y': evalrew_y,
         'evalrew_head_idx': evalrew_head_idx,
@@ -679,9 +679,10 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
             surr_after, kl, ent = sess.run([sy_surr, sy_kl, sy_ent], feed_dict=feed)
             if kl > 2 * desired_kl:
                 op_set_vars_from_flat.run(feed_dict={sy_theta: theta_old})
-                print(i, 'no update')
+                #print(i, 'no update')
             else:
-                print(i, 'kl, step norm, step max', kl, np.linalg.norm(step_taken), max(step_taken))
+                pass
+                #print(i, 'kl, step norm, step max', kl, np.linalg.norm(step_taken), max(step_taken))
 
             # ----- PLOTTING
             loss_y = loss_y_by_head[i]

@@ -1,3 +1,4 @@
 gym==0.8.1
+gym[mujuco]==0.8.1
 tqdm==4.11.2
 tensorflow=1.1.0

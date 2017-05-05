@@ -3,6 +3,7 @@
 Reference implementation: https://github.com/wojzaremba/trpo
 """
 
+import errno
 import sys
 import atexit
 import click
@@ -259,7 +260,7 @@ class NnValueFunction:
 def dump_stats(logdir, seed, k, stats):
     os.makedirs(logdir, exist_ok=True)
     statfile_path = osp.join(logdir, 's{}_k{}_{}_stats.pkl'.format(seed, k, os.getpid()))
-    os.symlink(statfile_path, osp.join(logdir, 's{}_k{}_stats.pkl'.format(seed, k)))
+    symlink(statfile_path, osp.join(logdir, 's{}_k{}_stats.pkl'.format(seed, k)))
     with open(statfile_path, 'wb') as f:
         pickle.dump(stats, f)
 
@@ -308,6 +309,15 @@ def gen_rollout(sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mea
         return paths, episodes_this_batch, timesteps_this_batch
 
 
+def symlink(source, link):
+    try:
+        os.symlink(source, link)
+    except OSError as e:
+        if e.errno == errno.EEXIST:
+            os.remove(link)
+            os.symlink(source, link)
+
+
 SEED_GYM = False
 
 
@@ -316,7 +326,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
 
     os.makedirs(logdir, exist_ok=True)
     logfile_path = osp.join(logdir, 's{}_k{}_{}.log'.format(seed, num_heads, os.getpid()))
-    os.symlink(logfile_path, osp.join(logdir, 's{}_k{}.log'.format(seed, num_heads)))
+    symlink(logfile_path, osp.join(logdir, 's{}_k{}.log'.format(seed, num_heads)))
     logfile = Unbuffered(open(logfile_path, 'w'))
     sys.stderr = sys.stdout
     sys.stdout = logfile
@@ -652,7 +662,9 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
                 op_set_vars_from_flat.run(feed_dict={sy_theta: theta_old})
                 print(i, 'no update')
             else:
-                print(i, 'kl, step norm, step max', kl, np.linalg.norm(step_taken), max(step_taken))
+                #print(i, 'kl, step norm, step max', kl, np.linalg.norm(step_taken), max(step_taken))
+                # TODO: above statement causes error sometimes
+                pass
 
             # ----- PLOTTING
             loss_y = loss_y_by_head[i]
@@ -714,7 +726,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         plot_filepath = osp.join(logdir, 's{}_k{}_{}_plot.png'.format(seed, num_heads, os.getpid()))
         plt.savefig(plot_filepath)
         if iter_i == 0:
-            os.symlink(plot_filepath, osp.join(logdir, 's{}_k{}_plot.png'.format(seed, num_heads)))
+            symlink(plot_filepath, osp.join(logdir, 's{}_k{}_plot.png'.format(seed, num_heads)))
 
         # ------- PLOTTING
         sys.stderr.flush()
@@ -748,6 +760,7 @@ def main(num_heads, seed, env, gamma, batch_timesteps, desired_kl, n_iter, vf_ep
     seeds = [int(s) for s in seed.split(',')]
     assert len(num_heads) == len(seeds)
 
+    logdir = osp.join(osp.dirname(osp.abspath(__file__)), 'log')
     shared_params = dict(
         animate=False,
         n_iter=n_iter,
@@ -755,7 +768,7 @@ def main(num_heads, seed, env, gamma, batch_timesteps, desired_kl, n_iter, vf_ep
         min_timesteps_per_batch=batch_timesteps,
         vf_params={'n_epochs': vf_epochs},
         vf_type='nn',
-        logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
+        logdir=logdir,
         gym_env=env,
         eval_every=eval_every,
         eval_timesteps=eval_timesteps,
@@ -766,9 +779,10 @@ def main(num_heads, seed, env, gamma, batch_timesteps, desired_kl, n_iter, vf_ep
         seed=s,
         desired_kl=(desired_kl / k),
         **shared_params
-    ) for s, k in zip(num_heads, seeds)]
+    ) for k, s in zip(num_heads, seeds)]
 
     def start_plot_server():
+        os.chdir(logdir)
         # Source: https://docs.python.org/3/library/http.server.html
         Handler = http.server.SimpleHTTPRequestHandler
         with socketserver.TCPServer(('0.0.0.0', server_port), Handler) as httpd:

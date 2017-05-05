@@ -37,8 +37,6 @@ def generate_handler(dyhtml, files=None, refresh_rate=-1):
                 self.end_headers()
                 self.wfile.write("<html><head>"
                                  "<title>mpld3 plot</title>".encode())
-                if refresh_rate > 0:
-                    self.wfile.write(('<meta http-equiv="refresh" content="{}"/>'.format(refresh_rate)).encode())
                 self.wfile.write("</head><body>\n".encode())
                 self.wfile.write(dyhtml.content.encode())
                 self.wfile.write("</body></html>".encode())

@@ -21,7 +21,6 @@ from tqdm import tqdm
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt  # noqa
-import mpld3_custom.mpld3 as mpld3  # noqa
 import seaborn as sns  # noqa
 
 
@@ -220,12 +219,11 @@ class LinearValueFunction:
 
 
 class NnValueFunction:
-    def __init__(self, ob_dim, n_epochs=20, stepsize=1e-3, logfile=None, rollout_head_i=None):
+    def __init__(self, ob_dim, n_epochs=20, stepsize=1e-3, logfile=None):
         self.ob_dim = ob_dim
         self.n_epochs = n_epochs
         self.stepsize = stepsize
         self.logfile = logfile
-        self.rollout_head_i = rollout_head_i
         self.init_tf()
 
     def init_tf(self):
@@ -233,7 +231,8 @@ class NnValueFunction:
 
         sy_h1 = tf.nn.elu(dense(self.sy_ob, 64, "v_h1", weight_init=normc_initializer(1.0)))
         sy_h2 = tf.nn.elu(dense(sy_h1, 64, "v_h2", weight_init=normc_initializer(1.0)))
-        self.sy_value = tf.reshape(dense(sy_h2, 1, 'value', weight_init=normc_initializer(0.1)), [-1])
+        sy_h3 = tf.nn.elu(dense(sy_h2, 64, "v_h3", weight_init=normc_initializer(1.0)))
+        self.sy_value = tf.reshape(dense(sy_h3, 1, 'value', weight_init=normc_initializer(0.1)), [-1])
 
         self.sy_targ_v = tf.placeholder(shape=[None], name='targ_v', dtype=tf.float32)
 
@@ -242,7 +241,7 @@ class NnValueFunction:
         self.update_op = tf.train.AdamOptimizer(self.stepsize).minimize(loss)
 
     def fit(self, X, y):
-        print('Fitting NNValueFunction for head {}'.format(self.rollout_head_i))
+        print('Fitting NNValueFunction')
         for _ in tqdm(range(self.n_epochs), file=self.logfile):
             self.update_op.run(feed_dict={
                 self.sy_ob: X,
@@ -255,9 +254,10 @@ class NnValueFunction:
         }))
 
 
-def dump_stats(logdir, k, stats):
+def dump_stats(logdir, seed, k, stats):
     os.makedirs(logdir, exist_ok=True)
-    statfile_path = osp.join(logdir, 'k{}_{}_stats.pkl'.format(k, os.getpid()))
+    statfile_path = osp.join(logdir, 's{}_k{}_{}_stats.pkl'.format(seed, k, os.getpid()))
+    os.symlink(statfile_path, osp.join(logdir, 's{}_k{}_stats.pkl'.format(seed, k)))
     with open(statfile_path, 'wb') as f:
         pickle.dump(stats, f)
 
@@ -305,12 +305,16 @@ def gen_rollout(sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mea
 
         return paths, episodes_this_batch, timesteps_this_batch
 
+
+SEED_GYM = False
+
+
 def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_batch,  # noqa
-          desired_kl, vf_type, vf_params, eval_every, eval_timesteps, animate=False,
-          mpld3_start_port=-1):
+          desired_kl, vf_type, vf_params, eval_every, eval_timesteps, animate=False):
 
     os.makedirs(logdir, exist_ok=True)
-    logfile_path = osp.join(logdir, 'k{}_{}.log'.format(num_heads, os.getpid()))
+    logfile_path = osp.join(logdir, 's{}_k{}_{}.log'.format(seed, num_heads, os.getpid()))
+    os.symlink(logfile_path, osp.join(logdir, 's{}_k{}.log'.format(seed, num_heads)))
     logfile = Unbuffered(open(logfile_path, 'w'))
     sys.stderr = sys.stdout
     sys.stdout = logfile
@@ -318,6 +322,8 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
     tf.set_random_seed(seed)
     np.random.seed(seed)
     env = gym.make(gym_env)
+    if SEED_GYM:
+        env.seed(seed)
     ob_dim = env.observation_space.shape[0]
     ac_dim = env.action_space.shape[0]
     print("ob_dim is:", ob_dim)
@@ -326,7 +332,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
     vf = {
         'linear': LinearValueFunction,
         'nn': NnValueFunction,
-    }[vf_type](ob_dim, logfile=logfile, rollout_head_i=0, **vf_params)
+    }[vf_type](ob_dim, logfile=logfile, **vf_params)
 
     with tf.variable_scope('shared'):
         sy_ob = tf.placeholder(shape=[None, ob_dim], name='ob', dtype=tf.float32)  # batch of observations
@@ -429,8 +435,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
     total_episodes = 0
 
     # ----- PLOTTING
-    dynamic_html = mpld3.DynamicHTML(None)
-    fig, axes = plt.subplots(5, 1, figsize=(8, 8))
+    fig, axes = plt.subplots(5, 1, figsize=(7, 10))
     rew_ax, loss_ax, kl_ax, ev_ax, evalrew_ax = axes
     plt.tight_layout(pad=2.0, h_pad=1.5)
 
@@ -489,7 +494,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
     args, _, _, values = inspect.getargvalues(inspect.currentframe())
     program_args = {arg: values[arg] for arg in args}
 
-    atexit.register(dump_stats, logdir, num_heads, {
+    atexit.register(dump_stats, logdir, seed, num_heads, {
         'program_args': program_args,
         'rew_x_by_head': rew_x_by_head,
         'rew_y_by_head': rew_y_by_head,
@@ -568,7 +573,8 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
             vtargs.append(discount(path["reward"], gamma))
             rew_t = path["reward"]
             return_t = discount(rew_t, gamma)
-            baseline_t = vf.predict(path["observation"])
+            path_obs = path["observation"]
+            baseline_t = vf.predict(path_obs)
             baselines.append(baseline_t)
             adv_t = return_t - baseline_t
             advs.append(adv_t)
@@ -576,9 +582,9 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         # Fit value function
         vtarg = np.concatenate(vtargs)
         ev_before = explained_variance_1d(np.concatenate(baselines), vtarg)
-        all_ob = np.concatenate([path["observation"] for path in paths])
-        vf.fit(all_ob, vtarg)  # fit!
-        ev_after = explained_variance_1d(np.squeeze(vf.predict(all_ob)), vtarg)
+        all_obs = np.concatenate([path["observation"] for path in paths])
+        vf.fit(all_obs, vtarg)  # fit!
+        ev_after = explained_variance_1d(np.squeeze(vf.predict(all_obs)), vtarg)
 
         max_kl = -np.inf
         avg_ent = 0
@@ -703,17 +709,10 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
             x_end += 1
         set_xbounds()
 
-        if mpld3_start_port < 0:
-            plt.pause(0.05)
-        else:
-            dynamic_html.content = mpld3.fig_to_html(fig)
-            global PROC_SERVER_THREAD
-            if PROC_SERVER_THREAD is None:
-                def d3show():
-                    mpld3.show(dynamic=dynamic_html, refresh_rate=REFRESH_RATE, ip='0.0.0.0',
-                               port=mpld3_start_port + (num_heads - 1))
-                PROC_SERVER_THREAD = threading.Thread(target=d3show, args=())
-                PROC_SERVER_THREAD.start()
+        plot_filepath = osp.join(logdir, 's{}_k{}_{}_plot.png'.format(seed, num_heads, os.getpid()))
+        plt.savefig(plot_filepath)
+        if iter_i == 0:
+            os.symlink(plot_filepath, osp.join(logdir, 's{}_k{}_plot.png'.format(seed, num_heads)))
         # ------- PLOTTING
         sys.stderr.flush()
         sys.stdout.flush()
@@ -735,12 +734,10 @@ def _main1(d):
 @click.option('--batch-timesteps', '-t', default=10000)
 @click.option('--desired-kl', default=2e-3)
 @click.option('--n-iter', default=400)
-@click.option('--mpld3-start-port', default=-1)
 @click.option('--vf-epochs', default=25)
 @click.option('--eval-every', default=10)
 @click.option('--eval-timesteps', default=10000)
-def main(num_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3_start_port,
-         vf_epochs, eval_every, eval_timesteps):
+def main(num_heads, env, gamma, batch_timesteps, desired_kl, n_iter, vf_epochs, eval_every, eval_timesteps):
     num_heads = [int(k) for k in num_heads.split(',')]
 
     shared_params = dict(
@@ -753,7 +750,6 @@ def main(num_heads, env, gamma, batch_timesteps, desired_kl, n_iter, mpld3_start
         seed=0,
         logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
         gym_env=env,
-        mpld3_start_port=mpld3_start_port,
         eval_every=eval_every,
         eval_timesteps=eval_timesteps,
     )

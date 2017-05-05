@@ -440,6 +440,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         ops_set_vars_from_flat += [op_set_vars_from_flat]
         sy_thetas += [sy_theta]
 
+    saver = tf.train.Saver()
     sess = tf.Session()
     # sess = tf_debug.LocalCLIDebugWrapperSession(sess)
     sess.__enter__()  # equivalent to `with sess:`
@@ -534,6 +535,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         def mask_func():
             return np.array([True])
 
+    best_overall_evalrew = -np.inf
     for iter_i in range(n_iter):
         print("********** Iteration %i ************" % iter_i)
         if iter_i > 0 and iter_i % eval_every == 0:
@@ -556,8 +558,17 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
 
             best_head_i = np.argmax(rew_means)
             best_reward = rew_means[best_head_i]
-
             print('### Best average, head %d: %f' % (best_head_i, best_reward))
+
+            if best_reward >= best_overall_evalrew:
+                best_overall_evalrew = best_reward
+            
+                model_subdir = osp.join(logdir, 'model_s{}_k{}_{}'.format(seed, num_heads, os.getpid()))
+                os.makedirs(model_subdir, exist_ok=True)
+                symlink(model_subdir, osp.join(logdir, 'model_s{}_k{}'.format(seed, num_heads)))
+            
+                model_path = osp.join(model_subdir, 'model_h{}'.format(best_head_i))
+                saver.save(sess, model_path, global_step=iter_i, write_meta_graph=False)
 
             evalrew_x += [iter_i]
             evalrew_y += [best_reward]

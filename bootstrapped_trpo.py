@@ -234,7 +234,8 @@ class NnValueFunction:
 
         sy_h1 = tf.nn.elu(dense(self.sy_ob, 64, "v_h1", weight_init=normc_initializer(1.0)))
         sy_h2 = tf.nn.elu(dense(sy_h1, 64, "v_h2", weight_init=normc_initializer(1.0)))
-        self.sy_value = tf.reshape(dense(sy_h2, 1, 'value', weight_init=normc_initializer(0.1)), [-1])
+        sy_h3 = tf.nn.elu(dense(sy_h2, 64, "v_h3", weight_init=normc_initializer(1.0)))
+        self.sy_value = tf.reshape(dense(sy_h3, 1, 'value', weight_init=normc_initializer(0.1)), [-1])
 
         self.sy_targ_v = tf.placeholder(shape=[None], name='targ_v', dtype=tf.float32)
 

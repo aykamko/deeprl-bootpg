@@ -3,6 +3,7 @@
 Reference implementation: https://github.com/wojzaremba/trpo
 """
 
+import errno
 import sys
 import atexit
 import click
@@ -233,8 +234,7 @@ class NnValueFunction:
 
         sy_h1 = tf.nn.elu(dense(self.sy_ob, 64, "v_h1", weight_init=normc_initializer(1.0)))
         sy_h2 = tf.nn.elu(dense(sy_h1, 64, "v_h2", weight_init=normc_initializer(1.0)))
-        sy_h3 = tf.nn.elu(dense(sy_h2, 64, "v_h3", weight_init=normc_initializer(1.0)))
-        self.sy_value = tf.reshape(dense(sy_h3, 1, 'value', weight_init=normc_initializer(0.1)), [-1])
+        self.sy_value = tf.reshape(dense(sy_h2, 1, 'value', weight_init=normc_initializer(0.1)), [-1])
 
         self.sy_targ_v = tf.placeholder(shape=[None], name='targ_v', dtype=tf.float32)
 
@@ -259,7 +259,7 @@ class NnValueFunction:
 def dump_stats(logdir, seed, k, stats):
     os.makedirs(logdir, exist_ok=True)
     statfile_path = osp.join(logdir, 's{}_k{}_{}_stats.pkl'.format(seed, k, os.getpid()))
-    os.symlink(statfile_path, osp.join(logdir, 's{}_k{}_stats.pkl'.format(seed, k)))
+    symlink(statfile_path, osp.join(logdir, 's{}_k{}_stats.pkl'.format(seed, k)))
     with open(statfile_path, 'wb') as f:
         pickle.dump(stats, f)
 
@@ -308,6 +308,15 @@ def gen_rollout(sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mea
         return paths, episodes_this_batch, timesteps_this_batch
 
 
+def symlink(source, link):
+    try:
+        os.symlink(source, link)
+    except OSError as e:
+        if e.errno == errno.EEXIST:
+            os.remove(link)
+            os.symlink(source, link)
+
+
 SEED_GYM = False
 
 
@@ -316,7 +325,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
 
     os.makedirs(logdir, exist_ok=True)
     logfile_path = osp.join(logdir, 's{}_k{}_{}.log'.format(seed, num_heads, os.getpid()))
-    os.symlink(logfile_path, osp.join(logdir, 's{}_k{}.log'.format(seed, num_heads)))
+    symlink(logfile_path, osp.join(logdir, 's{}_k{}.log'.format(seed, num_heads)))
     logfile = Unbuffered(open(logfile_path, 'w'))
     sys.stderr = sys.stdout
     sys.stdout = logfile
@@ -331,10 +340,13 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
     print("ob_dim is:", ob_dim)
     print("ac_dim is:", ac_dim)
 
-    vf = {
-        'linear': LinearValueFunction,
-        'nn': NnValueFunction,
-    }[vf_type](ob_dim, logfile=logfile, **vf_params)
+    head_vfs = []
+    for head_i in range(num_heads):
+        with tf.variable_scope('vf%d' % head_i):
+            head_vfs += [{
+                'linear': LinearValueFunction,
+                'nn': NnValueFunction,
+            }[vf_type](ob_dim, logfile=logfile, **vf_params)]
 
     with tf.variable_scope('shared'):
         sy_ob = tf.placeholder(shape=[None, ob_dim], name='ob', dtype=tf.float32)  # batch of observations
@@ -479,12 +491,16 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         kl_points, = kl_ax.plot(iter_x, kl_y)
         kl_points_by_head += [kl_points]
 
-    ev_ax.set_title('Explained Variance (Shared Value Function, Before vs. After Update)')
+    ev_ax.set_title('Explained Variance (Value Function, After Update)')
     ev_ax.set_ylim(-1, 1)
-    ev_before_y = []
-    ev_before_points, = ev_ax.plot(iter_x, ev_before_y)
-    ev_after_y = []
-    ev_after_points, = ev_ax.plot(iter_x, ev_after_y)
+    ev_x_by_head, ev_after_y_by_head, ev_before_y_by_head, ev_points_by_head = [], [], [], []
+    for i in range(num_heads):
+        ev_x, ev_after_y, ev_before_y = [], [], []
+        ev_x_by_head += [ev_x]
+        ev_after_y_by_head += [ev_after_y]
+        ev_before_y_by_head += [ev_before_y]
+        ev_points, = ev_ax.plot(ev_x, ev_after_y)
+        ev_points_by_head += [ev_points]
 
     evalrew_ax.set_title('Evaluation Average Reward (Best of all heads)')
     evalrew_x, evalrew_y, evalrew_head_idx = [], [], []
@@ -503,8 +519,9 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         'iter_x': iter_x,
         'loss_y_by_head': loss_y_by_head,
         'kl_y_by_head': kl_y_by_head,
-        'ev_before_y': ev_before_y,
-        'ev_after_y': ev_after_y,
+        'ev_x_by_head': ev_x_by_head,
+        'ev_before_y_by_head': ev_before_y,
+        'ev_after_y_by_head': ev_after_y,
         'evalrew_x': evalrew_x,
         'evalrew_y': evalrew_y,
         'evalrew_head_idx': evalrew_head_idx,
@@ -570,13 +587,14 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         total_timesteps += timesteps_this_batch
 
         # Estimate advantage function
+        rollout_vf = head_vfs[rollout_head_i]
         vtargs, baselines, advs = [], [], []
         for path in paths:
             vtargs.append(discount(path["reward"], gamma))
             rew_t = path["reward"]
             return_t = discount(rew_t, gamma)
             path_obs = path["observation"]
-            baseline_t = vf.predict(path_obs)
+            baseline_t = rollout_vf.predict(path_obs)
             baselines.append(baseline_t)
             adv_t = return_t - baseline_t
             advs.append(adv_t)
@@ -585,8 +603,19 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         vtarg = np.concatenate(vtargs)
         ev_before = explained_variance_1d(np.concatenate(baselines), vtarg)
         all_obs = np.concatenate([path["observation"] for path in paths])
-        vf.fit(all_obs, vtarg)  # fit!
-        ev_after = explained_variance_1d(np.squeeze(vf.predict(all_obs)), vtarg)
+        rollout_vf.fit(all_obs, vtarg)  # fit!
+        ev_after = explained_variance_1d(np.squeeze(rollout_vf.predict(all_obs)), vtarg)
+
+        # ------- START PLOTTING
+        ev_x = ev_x_by_head[rollout_head_i]
+        ev_after_y = ev_after_y_by_head[rollout_head_i]
+        ev_before_y = ev_before_y_by_head[rollout_head_i]
+        ev_x += [iter_i]
+        ev_before_y += [ev_before]
+        ev_after_y += [ev_after]
+        ev_points_by_head[rollout_head_i]._y = ev_after_y  # XXX: bug in mpl
+        ev_points_by_head[rollout_head_i].set_data(ev_x, ev_after_y)
+        # ------- END PLOTTING
 
         max_kl = -np.inf
         avg_ent = 0
@@ -699,12 +728,6 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         # recompute loss axis
         rew_ax.relim()
         rew_ax.autoscale()
-        ev_before_y += [ev_before]
-        ev_after_y += [ev_after]
-        ev_before_points._y = ev_before_y  # XXX: bug in matplotlib
-        ev_before_points.set_data(iter_x, ev_before_y)
-        ev_after_points._y = ev_after_y  # XXX: bug in matplotlib
-        ev_after_points.set_data(iter_x, ev_after_y)
 
         if iter_i > 45:
             # x_start += 1
@@ -714,7 +737,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         plot_filepath = osp.join(logdir, 's{}_k{}_{}_plot.png'.format(seed, num_heads, os.getpid()))
         plt.savefig(plot_filepath)
         if iter_i == 0:
-            os.symlink(plot_filepath, osp.join(logdir, 's{}_k{}_plot.png'.format(seed, num_heads)))
+            symlink(plot_filepath, osp.join(logdir, 's{}_k{}_plot.png'.format(seed, num_heads)))
 
         # ------- PLOTTING
         sys.stderr.flush()
@@ -748,6 +771,7 @@ def main(num_heads, seed, env, gamma, batch_timesteps, desired_kl, n_iter, vf_ep
     seeds = [int(s) for s in seed.split(',')]
     assert len(num_heads) == len(seeds)
 
+    logdir = osp.join(osp.dirname(osp.abspath(__file__)), 'log')
     shared_params = dict(
         animate=False,
         n_iter=n_iter,
@@ -755,7 +779,7 @@ def main(num_heads, seed, env, gamma, batch_timesteps, desired_kl, n_iter, vf_ep
         min_timesteps_per_batch=batch_timesteps,
         vf_params={'n_epochs': vf_epochs},
         vf_type='nn',
-        logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
+        logdir=logdir,
         gym_env=env,
         eval_every=eval_every,
         eval_timesteps=eval_timesteps,
@@ -766,9 +790,10 @@ def main(num_heads, seed, env, gamma, batch_timesteps, desired_kl, n_iter, vf_ep
         seed=s,
         desired_kl=(desired_kl / k),
         **shared_params
-    ) for s, k in zip(num_heads, seeds)]
+    ) for k, s in zip(num_heads, seeds)]
 
     def start_plot_server():
+        os.chdir(logdir)
         # Source: https://docs.python.org/3/library/http.server.html
         Handler = http.server.SimpleHTTPRequestHandler
         with socketserver.TCPServer(('0.0.0.0', server_port), Handler) as httpd:

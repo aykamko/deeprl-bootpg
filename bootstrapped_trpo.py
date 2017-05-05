@@ -16,6 +16,8 @@ import tensorflow as tf
 import logz
 import threading
 import multiprocessing
+import http.server
+import socketserver
 from os import path as osp
 from tqdm import tqdm
 import matplotlib
@@ -713,6 +715,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         plt.savefig(plot_filepath)
         if iter_i == 0:
             os.symlink(plot_filepath, osp.join(logdir, 's{}_k{}_plot.png'.format(seed, num_heads)))
+
         # ------- PLOTTING
         sys.stderr.flush()
         sys.stdout.flush()
@@ -731,14 +734,19 @@ def _main1(d):
 @click.option('--env', default='Pendulum-v0')
 @click.option('--gamma', '-g', default=0.97)
 @click.option('--num-heads', '-k', default='1')
+@click.option('--seed', '-s', default='0')
 @click.option('--batch-timesteps', '-t', default=10000)
 @click.option('--desired-kl', default=2e-3)
-@click.option('--n-iter', default=400)
+@click.option('--n-iter', default=300)
 @click.option('--vf-epochs', default=25)
 @click.option('--eval-every', default=10)
 @click.option('--eval-timesteps', default=10000)
-def main(num_heads, env, gamma, batch_timesteps, desired_kl, n_iter, vf_epochs, eval_every, eval_timesteps):
+@click.option('--server-port', default=13337)
+def main(num_heads, seed, env, gamma, batch_timesteps, desired_kl, n_iter, vf_epochs, eval_every, 
+         eval_timesteps, server_port):
     num_heads = [int(k) for k in num_heads.split(',')]
+    seeds = [int(s) for s in seed.split(',')]
+    assert len(num_heads) == len(seeds)
 
     shared_params = dict(
         animate=False,
@@ -747,7 +755,6 @@ def main(num_heads, env, gamma, batch_timesteps, desired_kl, n_iter, vf_epochs, 
         min_timesteps_per_batch=batch_timesteps,
         vf_params={'n_epochs': vf_epochs},
         vf_type='nn',
-        seed=0,
         logdir=osp.join(osp.dirname(osp.abspath(__file__)), 'log'),
         gym_env=env,
         eval_every=eval_every,
@@ -756,9 +763,20 @@ def main(num_heads, env, gamma, batch_timesteps, desired_kl, n_iter, vf_epochs, 
 
     params = [dict(
         num_heads=k,
+        seed=s,
         desired_kl=(desired_kl / k),
         **shared_params
-    ) for k in num_heads]
+    ) for s, k in zip(num_heads, seeds)]
+
+    def start_plot_server():
+        # Source: https://docs.python.org/3/library/http.server.html
+        Handler = http.server.SimpleHTTPRequestHandler
+        with socketserver.TCPServer(('0.0.0.0', server_port), Handler) as httpd:
+            print('serving at port', server_port)
+            httpd.serve_forever()
+
+    server_thread = threading.Thread(target=start_plot_server, args=(), daemon=True)
+    server_thread.start()
 
     p = multiprocessing.Pool(len(num_heads))
     p.map(_main1, params)

@@ -222,15 +222,17 @@ class LinearValueFunction:
 
 
 class NnValueFunction:
-    def __init__(self, ob_dim, n_epochs=20, stepsize=1e-3, logfile=None):
+    def __init__(self, ob_dim, n_epochs=20, stepsize=1e-3, logfile=None, num_heads=None):
+        assert num_heads is not None
         self.ob_dim = ob_dim
         self.n_epochs = n_epochs
         self.stepsize = stepsize
         self.logfile = logfile
+        self.num_heads = num_heads
         self.init_tf()
 
     def init_tf(self):
-        self.sy_ob = tf.placeholder(shape=[None, self.ob_dim + 1], name='v_ob', dtype=tf.float32)
+        self.sy_ob = tf.placeholder(shape=[None, self.ob_dim + self.num_heads], name='v_ob', dtype=tf.float32)
 
         sy_h1 = tf.nn.elu(dense(self.sy_ob, 64, "v_h1", weight_init=normc_initializer(1.0)))
         sy_h2 = tf.nn.elu(dense(sy_h1, 64, "v_h2", weight_init=normc_initializer(1.0)))
@@ -344,7 +346,7 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
     vf = {
         'linear': LinearValueFunction,
         'nn': NnValueFunction,
-    }[vf_type](ob_dim, logfile=logfile, **vf_params)
+    }[vf_type](ob_dim, logfile=logfile, num_heads=num_heads, **vf_params)
 
     with tf.variable_scope('shared'):
         sy_ob = tf.placeholder(shape=[None, ob_dim], name='ob', dtype=tf.float32)  # batch of observations
@@ -597,7 +599,9 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
             rew_t = path["reward"]
             return_t = discount(rew_t, gamma)
             path_obs = path["observation"]
-            path_obs_with_head_idx = np.hstack((path_obs, (np.ones((path_obs.shape[0], 1)) * rollout_head_i)))
+            one_hot_idx = np.zeros((path_obs.shape[0], num_heads))
+            one_hot_idx[np.arange(path_obs.shape[0]), rollout_head_i] = 1
+            path_obs_with_head_idx = np.hstack((path_obs, one_hot_idx))
             baseline_t = vf.predict(path_obs_with_head_idx)
             baselines.append(baseline_t)
             adv_t = return_t - baseline_t
@@ -607,7 +611,9 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         vtarg = np.concatenate(vtargs)
         ev_before = explained_variance_1d(np.concatenate(baselines), vtarg)
         all_obs = np.concatenate([path["observation"] for path in paths])
-        all_obs_with_head_idx = np.hstack((all_obs, (np.ones((all_obs.shape[0], 1)) * rollout_head_i)))
+        one_hot_idx = np.zeros((all_obs.shape[0], num_heads))
+        one_hot_idx[np.arange(all_obs.shape[0]), rollout_head_i] = 1
+        all_obs_with_head_idx = np.hstack((all_obs, one_hot_idx))
         vf.fit(all_obs_with_head_idx, vtarg)  # fit!
         ev_after = explained_variance_1d(np.squeeze(vf.predict(all_obs_with_head_idx)), vtarg)
 

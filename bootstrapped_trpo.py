@@ -294,6 +294,7 @@ def gen_rollout(sess, env, min_timesteps_per_batch, sy_ob, sy_sampled_ac, sy_mea
 
                 rewards.append(rew)
                 if done:
+                    terminated = True
                     break
 
             path = {"observation": np.array(obs),
@@ -320,10 +321,17 @@ def symlink(source, link):
             os.symlink(source, link)
 
 
+def onehot_idx(shape, idx):
+    w, h = shape
+    one_hot_idx = np.zeros(shape)
+    one_hot_idx[np.arange(w), idx] = 1
+    return one_hot_idx
+
+
 SEED_GYM = False
 
 
-def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_batch,  # noqa
+def _main(gym_env, logdir, seed, n_iter, gamma, lamb, num_heads, min_timesteps_per_batch,  # noqa
           desired_kl, vf_type, vf_params, eval_every, eval_timesteps, animate=False):
 
     os.makedirs(logdir, exist_ok=True)
@@ -595,25 +603,29 @@ def _main(gym_env, logdir, seed, n_iter, gamma, num_heads, min_timesteps_per_bat
         # Estimate advantage function
         vtargs, baselines, advs = [], [], []
         for path in paths:
-            vtargs.append(discount(path["reward"], gamma))
-            rew_t = path["reward"]
-            return_t = discount(rew_t, gamma)
+            return_t = discount(path["reward"], gamma)
+            vtargs.append(return_t)
+
+            # Generalized Advantage Estimation 
             path_obs = path["observation"]
-            one_hot_idx = np.zeros((path_obs.shape[0], num_heads))
-            one_hot_idx[np.arange(path_obs.shape[0]), rollout_head_i] = 1
-            path_obs_with_head_idx = np.hstack((path_obs, one_hot_idx))
+            path_obs_with_head_idx = np.hstack(
+                [path_obs, onehot_idx((path_obs.shape[0], num_heads), rollout_head_i)])
             baseline_t = vf.predict(path_obs_with_head_idx)
+            b1 = np.append(baseline_t, 0)  # our paths are always terminated
+            deltas_t = path["reward"] + gamma*b1[1:] - b1[:-1]
+            adv_t = discount(deltas_t, gamma * lamb)
+
             baselines.append(baseline_t)
-            adv_t = return_t - baseline_t
             advs.append(adv_t)
 
         # Fit value function
         vtarg = np.concatenate(vtargs)
         ev_before = explained_variance_1d(np.concatenate(baselines), vtarg)
+
         all_obs = np.concatenate([path["observation"] for path in paths])
-        one_hot_idx = np.zeros((all_obs.shape[0], num_heads))
-        one_hot_idx[np.arange(all_obs.shape[0]), rollout_head_i] = 1
-        all_obs_with_head_idx = np.hstack((all_obs, one_hot_idx))
+        all_obs_with_head_idx = np.hstack(
+            [all_obs, onehot_idx((all_obs.shape[0], num_heads), rollout_head_i)])
+
         vf.fit(all_obs_with_head_idx, vtarg)  # fit!
         ev_after = explained_variance_1d(np.squeeze(vf.predict(all_obs_with_head_idx)), vtarg)
 
@@ -762,8 +774,9 @@ def _main1(d):
 
 
 @click.command()
-@click.option('--env', default='Pendulum-v0')
-@click.option('--gamma', '-g', default=0.97)
+@click.option('--env', default='Humanoid-v1')
+@click.option('--gamma', '-g', default=0.995)
+@click.option('--lamb', '-l', default=0.97)
 @click.option('--num-heads', '-k', default='1')
 @click.option('--seed', '-s', default='0')
 @click.option('--batch-timesteps', '-t', default=10000)
@@ -773,7 +786,7 @@ def _main1(d):
 @click.option('--eval-every', default=10)
 @click.option('--eval-timesteps', default=10000)
 @click.option('--server-port', default=13337)
-def main(num_heads, seed, env, gamma, batch_timesteps, desired_kl, n_iter, vf_epochs, eval_every, 
+def main(num_heads, seed, env, gamma, lamb, batch_timesteps, desired_kl, n_iter, vf_epochs, eval_every, 
          eval_timesteps, server_port):
     num_heads = [int(k) for k in num_heads.split(',')]
     seeds = [int(s) for s in seed.split(',')]
@@ -784,6 +797,7 @@ def main(num_heads, seed, env, gamma, batch_timesteps, desired_kl, n_iter, vf_ep
         animate=False,
         n_iter=n_iter,
         gamma=gamma,
+        lamb=lamb,
         min_timesteps_per_batch=batch_timesteps,
         vf_params={'n_epochs': vf_epochs},
         vf_type='nn',

@@ -21,6 +21,7 @@ import http.server
 import socketserver
 from os import path as osp
 from tqdm import tqdm
+from tensorflow.contrib.opt.python.training.external_optimizer import ScipyOptimizerInterface
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt  # noqa
@@ -222,7 +223,7 @@ class LinearValueFunction:
 
 
 class NnValueFunction:
-    def __init__(self, ob_dim, n_epochs=20, stepsize=1e-3, logfile=None, num_heads=None):
+    def __init__(self, ob_dim, n_epochs=25, stepsize=1e-3, logfile=None, num_heads=None):
         assert num_heads is not None
         self.ob_dim = ob_dim
         self.n_epochs = n_epochs
@@ -232,26 +233,32 @@ class NnValueFunction:
         self.init_tf()
 
     def init_tf(self):
-        self.sy_ob = tf.placeholder(shape=[None, self.ob_dim + self.num_heads], name='v_ob', dtype=tf.float32)
+        with tf.variable_scope('nnvf'):
+            self.sy_ob = tf.placeholder(shape=[None, self.ob_dim + self.num_heads], name='v_ob', dtype=tf.float32)
 
-        sy_h1 = tf.nn.elu(dense(self.sy_ob, 64, "v_h1", weight_init=normc_initializer(1.0)))
-        sy_h2 = tf.nn.elu(dense(sy_h1, 64, "v_h2", weight_init=normc_initializer(1.0)))
-        sy_h3 = tf.nn.elu(dense(sy_h2, 64, "v_h3", weight_init=normc_initializer(1.0)))
-        self.sy_value = tf.reshape(dense(sy_h3, 1, 'value', weight_init=normc_initializer(0.1)), [-1])
+            sy_h1 = tf.nn.elu(dense(self.sy_ob, 64, "v_h1", weight_init=normc_initializer(1.0)))
+            sy_h2 = tf.nn.elu(dense(sy_h1, 64, "v_h2", weight_init=normc_initializer(1.0)))
+            sy_h3 = tf.nn.elu(dense(sy_h2, 64, "v_h3", weight_init=normc_initializer(1.0)))
+            self.sy_value = tf.reshape(dense(sy_h3, 1, 'value', weight_init=normc_initializer(0.1)), [-1])
 
         self.sy_targ_v = tf.placeholder(shape=[None], name='targ_v', dtype=tf.float32)
 
-        loss = tf.reduce_mean(tf.square(self.sy_value - self.sy_targ_v))
+        mse_loss = tf.reduce_mean(tf.square(self.sy_value - self.sy_targ_v))  # mse
 
-        self.update_op = tf.train.AdamOptimizer(self.stepsize).minimize(loss)
+        nnvf_var_list = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=('nnvf'))
+        # https://goo.gl/DOXf7s
+        l2_loss = 1e-3 * tf.reduce_sum([tf.square(v) for v in nnvf_var_list])
+
+        loss = ms2_loss + l2_loss
+
+        self.update_op = ScipyOptimizerInterface(loss, options={'maxiter': self.n_epochs}).minimize()
 
     def fit(self, X, y):
-        print('Fitting NNValueFunction')
-        for _ in tqdm(range(self.n_epochs), file=self.logfile):
-            self.update_op.run(feed_dict={
-                self.sy_ob: X,
-                self.sy_targ_v: y,
-            })
+        print('Fitting NNValueFunction with L-BFGS')
+        self.update_op.run(feed_dict={
+            self.sy_ob: X,
+            self.sy_targ_v: y,
+        })
 
     def predict(self, X):
         return np.squeeze(self.sy_value.eval(feed_dict={
